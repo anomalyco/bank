@@ -64,10 +64,23 @@ type SlackMember = {
   is_ultra_restricted?: boolean
   is_admin?: boolean
   is_owner?: boolean
+  team_id?: string
+  enterprise_user?: { teams?: string[] }
   profile?: { display_name?: string; real_name?: string; image_72?: string }
 }
 
-type Profile = { id: string; name: string; image: string | null; bot: boolean; deleted: boolean; admin: boolean }
+type Profile = {
+  id: string
+  name: string
+  image: string | null
+  bot: boolean
+  deleted: boolean
+  admin: boolean
+  /** From another organization, through a Slack Connect channel. Never gets an account. */
+  outsider: boolean
+  /** A single- or multi-channel guest. Can hold coins, but gets no starting grant. */
+  guest: boolean
+}
 
 type Move =
   | { ok: true; id: number; from: number | null; to: number | null }
@@ -236,6 +249,10 @@ export class Workspace extends DurableObject<Env> {
           deleted?: boolean
           is_admin?: boolean
           is_owner?: boolean
+          is_restricted?: boolean
+          is_ultra_restricted?: boolean
+          team_id?: string
+          enterprise_user?: { teams?: string[] }
           profile?: { display_name?: string; real_name?: string; image_72?: string }
         }
       }>("users.info", { user: id })
@@ -247,11 +264,20 @@ export class Workspace extends DurableObject<Env> {
         bot: Boolean(user.is_bot) || user.id === "USLACKBOT",
         deleted: Boolean(user.deleted),
         admin: Boolean(user.is_admin || user.is_owner),
+        outsider: this.outsider(user),
+        guest: Boolean(user.is_restricted || user.is_ultra_restricted),
       }
     } catch (error) {
       console.error("users.info failed", id, error)
       return null
     }
+  }
+
+  /** True for people whose home workspace isn't this one, such as Slack Connect members from other companies. */
+  private outsider(user: { team_id?: string; enterprise_user?: { teams?: string[] } }) {
+    const team = this.install()?.teamId
+    if (!team || !user.team_id) return true
+    return user.team_id !== team && !(user.enterprise_user?.teams ?? []).includes(team)
   }
 
   /** Opens accounts for people seen for the first time, each with the starting grant. */
@@ -261,6 +287,10 @@ export class Workspace extends DurableObject<Env> {
     const config = this.config()
     for (const profile of profiles) {
       if (!profile) continue
+      if (profile.outsider) {
+        console.log("outsider refused", { user: profile.id })
+        continue
+      }
       this.ctx.storage.transactionSync(() => {
         const created = this.sql.exec(
           "insert or ignore into accounts (id, name, image, bot, slack_admin, created_at) values (?, ?, ?, ?, ?, ?)",
@@ -271,7 +301,7 @@ export class Workspace extends DurableObject<Env> {
           profile.admin ? 1 : 0,
           Date.now(),
         ).rowsWritten
-        if (!created || profile.bot || profile.deleted || config.starting <= 0) return
+        if (!created || profile.bot || profile.deleted || profile.guest || config.starting <= 0) return
         this.sql.exec("update accounts set balance = ? where id = ?", config.starting, profile.id)
         this.sql.exec(
           "insert into entries (at, kind, to_id, amount, note) values (?, 'grant', ?, ?, ?)",
@@ -340,6 +370,8 @@ export class Workspace extends DurableObject<Env> {
    */
   private applyMember(member: SlackMember, config: Config, now: number) {
     if (member.is_bot || member.is_app_user || member.id === "USLACKBOT") return
+    // user_change also fires for Slack Connect members of other companies; they never get an account.
+    if (this.outsider(member)) return
     const name = member.profile?.display_name || member.profile?.real_name || member.real_name || member.name
     const image = member.profile?.image_72 ?? null
     const admin = member.is_admin || member.is_owner ? 1 : 0
@@ -699,8 +731,8 @@ export class Workspace extends DurableObject<Env> {
     if (recent >= 30) return { ok: false, message: "slow down, try again in a minute" }
     const accounts = await this.ensure([from, to])
     const recipient = accounts.get(to)
-    if (!accounts.get(from)) return { ok: false, message: "couldn't look you up in slack, try again" }
-    if (!recipient) return { ok: false, message: "couldn't find that person" }
+    if (!accounts.get(from)) return { ok: false, message: `only members of ${this.install()?.teamName ?? "this workspace"} can give ${config.plural}` }
+    if (!recipient) return { ok: false, message: `only members of ${this.install()?.teamName ?? "this workspace"} can get ${config.plural}` }
     if (recipient.bot) return { ok: false, message: `bots can't hold ${config.plural}` }
     const result = this.move({ from, to, amount, kind, note, actor: from, link })
     if (!result.ok) {
