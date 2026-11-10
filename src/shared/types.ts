@@ -3,6 +3,7 @@ export type EmojiValue = { name: string; amount: number }
 export type Config = {
   singular: string
   plural: string
+  /** Name of the workspace emoji that stands for the currency, without colons. */
   symbol: string
   starting: number
   emoji: EmojiValue[]
@@ -12,7 +13,7 @@ export type Config = {
 export const defaultConfig: Config = {
   singular: "coin",
   plural: "coins",
-  symbol: "🪙",
+  symbol: "coin-10",
   starting: 100,
   emoji: [
     { name: "coin-1", amount: 1 },
@@ -53,7 +54,11 @@ export type Me = {
   installed: boolean
   account: Account | null
   config: Config
+  /** Image URLs for the workspace's custom emoji used by the config (the symbol and the reactions). */
+  emoji: Record<string, string>
 }
+
+export const EMOJI_NAME = /^[a-z0-9_\-+'.]+$/
 
 export type Leaderboard = { accounts: Account[] }
 

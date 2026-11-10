@@ -3,7 +3,7 @@
 import sharp from "sharp"
 import { mkdirSync, statSync } from "node:fs"
 
-const packs = ["classic", "anomaly"]
+const packs = ["anomaly"]
 
 for (const pack of packs) {
   mkdirSync(`public/emoji/${pack}`, { recursive: true })

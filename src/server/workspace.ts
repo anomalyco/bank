@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers"
 import {
   currency,
   defaultConfig,
+  EMOJI_NAME,
   type Account,
   type Admin,
   type Config,
@@ -154,7 +155,29 @@ export class Workspace extends DurableObject<Env> {
   }
 
   private config(): Config {
-    return { ...defaultConfig, ...this.meta<Partial<Config>>("config") }
+    const config = { ...defaultConfig, ...this.meta<Partial<Config>>("config") }
+    // Configs saved before the symbol became an emoji held a literal character.
+    if (!EMOJI_NAME.test(config.symbol)) config.symbol = defaultConfig.symbol
+    return config
+  }
+
+  /** The workspace's custom emoji by name, with aliases resolved. Cached for five minutes. */
+  private async emojiUrls(force = false): Promise<Record<string, string>> {
+    const cached = this.meta<{ at: number; urls: Record<string, string> }>("emoji")
+    if (cached && !force && Date.now() - cached.at < 5 * 60 * 1000) return cached.urls
+    try {
+      const result = await this.call<{ emoji: Record<string, string> }>("emoji.list")
+      const urls: Record<string, string> = {}
+      for (const [name, url] of Object.entries(result.emoji)) {
+        const target = url.startsWith("alias:") ? result.emoji[url.slice(6)] : url
+        if (target && !target.startsWith("alias:")) urls[name] = target
+      }
+      this.setMeta("emoji", { at: Date.now(), urls })
+      return urls
+    } catch (error) {
+      console.error("emoji.list failed", error)
+      return cached?.urls ?? {}
+    }
   }
 
   private row(id: string) {
@@ -425,7 +448,14 @@ export class Workspace extends DurableObject<Env> {
     await this.freshen()
     const install = this.install()
     const row = this.row(viewer.id)
+    const config = this.config()
+    const all = install?.token ? await this.emojiUrls() : {}
+    const emoji: Record<string, string> = {}
+    for (const name of [config.symbol, ...config.emoji.map((item) => item.name)]) {
+      if (all[name]) emoji[name] = all[name]
+    }
     return {
+      emoji,
       user: viewer,
       team: install
         ? { id: install.teamId, name: install.teamName, domain: install.domain, icon: install.icon }
@@ -433,7 +463,7 @@ export class Workspace extends DurableObject<Env> {
       installed: Boolean(install?.token),
       admin: this.isAdmin(viewer.id),
       account: row ? this.account(row) : null,
-      config: this.config(),
+      config,
     }
   }
 
@@ -491,13 +521,15 @@ export class Workspace extends DurableObject<Env> {
     const names = new Set<string>()
     const emoji = (input.emoji ?? [])
       .map((item) => ({ name: clean(item.name, 100).replace(/^:|:$/g, "").toLowerCase(), amount: Math.floor(Number(item.amount)) }))
-      .filter((item) => /^[a-z0-9_\-+'.]+$/.test(item.name) && item.amount > 0 && item.amount <= 1_000_000)
+      .filter((item) => EMOJI_NAME.test(item.name) && item.amount > 0 && item.amount <= 1_000_000)
       .filter((item) => !names.has(item.name) && names.add(item.name))
       .slice(0, 24)
     const config: Config = {
       singular: clean(input.singular, 32) || defaultConfig.singular,
       plural: clean(input.plural, 32) || defaultConfig.plural,
-      symbol: clean(input.symbol, 8),
+      symbol: EMOJI_NAME.test(clean(input.symbol, 100).replace(/^:|:$/g, "").toLowerCase())
+        ? clean(input.symbol, 100).replace(/^:|:$/g, "").toLowerCase()
+        : defaultConfig.symbol,
       starting: Math.max(0, Math.min(1_000_000, Math.floor(Number(input.starting) || 0))),
       emoji,
       notify: Boolean(input.notify),
@@ -550,9 +582,8 @@ export class Workspace extends DurableObject<Env> {
 
   async customEmoji(viewer: Viewer): Promise<CustomEmoji[]> {
     this.assertAdmin(viewer)
-    const result = await this.call<{ emoji: Record<string, string> }>("emoji.list")
-    return Object.entries(result.emoji)
-      .filter(([, url]) => !url.startsWith("alias:"))
+    // Admins come here right after adding emoji in Slack, so skip the cache.
+    return Object.entries(await this.emojiUrls(true))
       .map(([name, url]) => ({ name, url }))
       .sort((a, b) => a.name.localeCompare(b.name))
   }
@@ -644,7 +675,7 @@ export class Workspace extends DurableObject<Env> {
 
     if (sub === "balance" || sub === "bal") {
       const row = (await this.ensure([params.user_id])).get(params.user_id)
-      return reply(`you have *${currency(config, row?.balance ?? 0)}* ${config.symbol}`.trim())
+      return reply(`you have *${currency(config, row?.balance ?? 0)}* :${config.symbol}:`.trim())
     }
 
     if (sub === "top" || sub === "leaderboard") {
@@ -693,7 +724,7 @@ export class Workspace extends DurableObject<Env> {
     if (!result.ok) return reply(result.message)
     return {
       response_type: "in_channel",
-      text: `${config.symbol} <@${params.user_id}> gave <@${to}> *${currency(config, amount)}*${note ? ` · ${note}` : ""}`.trim(),
+      text: `:${config.symbol}: <@${params.user_id}> gave <@${to}> *${currency(config, amount)}*${note ? ` · ${note}` : ""}`.trim(),
     }
   }
 
@@ -769,7 +800,7 @@ export class Workspace extends DurableObject<Env> {
       const where = link ? ` for <${link}|your message>` : ""
       await this.call("chat.postMessage", {
         channel: to,
-        text: `${config.symbol} <@${event.user}> gave you *${currency(config, value.amount)}*${where}`.trim(),
+        text: `:${config.symbol}: <@${event.user}> gave you *${currency(config, value.amount)}*${where}`.trim(),
         unfurl_links: false,
       }).catch((error) => console.error("notify failed", error))
     }
