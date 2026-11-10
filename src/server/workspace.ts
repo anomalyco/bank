@@ -87,7 +87,11 @@ type MemberEvent = { type: "team_join" | "user_change"; user: SlackMember }
 /** The events the app subscribes to (see slack-manifest.json). */
 export type EventEnvelope = {
   event_id: string
-  event: ReactionEvent | MemberEvent | { type: "app_uninstalled" | "tokens_revoked" }
+  event:
+    | ReactionEvent
+    | MemberEvent
+    | { type: "channel_created"; channel: { id: string } }
+    | { type: "app_uninstalled" | "tokens_revoked" }
 }
 
 const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
@@ -402,6 +406,13 @@ export class Workspace extends DurableObject<Env> {
       this.setMeta("synced", Date.now())
       this.ctx.waitUntil(this.syncMembers().catch((error) => console.error("sync failed", error)))
     }
+    // Channel creation is pushed as an event; this daily pass catches anything missed, and workspaces installed
+    // before Bank joined channels on its own.
+    const joined = this.meta<number>("joined")
+    if (!joined || Date.now() - joined > 24 * 60 * 60 * 1000) {
+      this.setMeta("joined", Date.now())
+      this.ctx.waitUntil(this.joinPublicChannels().catch((error) => console.error("join failed", error)))
+    }
   }
 
   private isAdmin(id: string) {
@@ -419,6 +430,7 @@ export class Workspace extends DurableObject<Env> {
       Date.now(),
     )
     await this.syncMembers().catch((error) => console.error("sync failed", error))
+    this.ctx.waitUntil(this.joinPublicChannels().catch((error) => console.error("join failed", error)))
     const accounts = await this.ensure([data.installer])
     const row = accounts.get(data.installer)
     return { id: data.installer, name: row?.name ?? "someone", image: row?.image ?? null }
@@ -612,6 +624,12 @@ export class Workspace extends DurableObject<Env> {
 
   async joinChannels(viewer: Viewer) {
     this.assertAdmin(viewer)
+    return this.joinPublicChannels()
+  }
+
+  /** Slack only sends reaction events from channels the app is in, so Bank joins every public channel itself. */
+  private async joinPublicChannels() {
+    this.setMeta("joined", Date.now())
     let joined = 0
     let cursor: string | undefined
     do {
@@ -755,6 +773,12 @@ export class Workspace extends DurableObject<Env> {
     if (!this.install()?.token) return
     if (event.type === "reaction_added" || event.type === "reaction_removed") {
       return this.reaction(event)
+    }
+    if (event.type === "channel_created") {
+      await this.call("conversations.join", { channel: event.channel.id }).catch((error) =>
+        console.error("join failed", event.channel.id, error),
+      )
+      return
     }
     if (event.type === "team_join" || event.type === "user_change") {
       const config = this.config()

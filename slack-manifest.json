@@ -56,7 +56,8 @@
         "app_uninstalled",
         "tokens_revoked",
         "team_join",
-        "user_change"
+        "user_change",
+        "channel_created"
       ]
     },
     "org_deploy_enabled": false,
