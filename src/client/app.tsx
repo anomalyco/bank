@@ -369,14 +369,15 @@ function ago(at: number) {
 
 function describe(entry: Entry, history: History, viewer: string | null) {
   const name = (id: string | null) => (id ? (id === viewer ? "you" : (history.people[id]?.name ?? id)) : "the bank")
+  const possessive = (id: string | null) => (id && id === viewer ? "your" : `${name(id)}'s`)
   const via = entry.kind === "reaction" ? " with a reaction" : ""
   switch (entry.kind) {
     case "grant":
       return `${name(entry.to)} got a starting balance`
     case "adjust":
       return entry.to
-        ? `${name(entry.actor)} added to ${name(entry.to)}'s balance`
-        : `${name(entry.actor)} took from ${name(entry.from)}'s balance`
+        ? `${name(entry.actor)} added to ${possessive(entry.to)} balance`
+        : `${name(entry.actor)} took from ${possessive(entry.from)} balance`
     case "refund":
       return `${name(entry.from)} got back a reaction from ${name(entry.to)}`.replace(/^you got back/, "you returned")
     default:
@@ -1024,7 +1025,7 @@ function AdminsPanel(props: { me: Me }) {
   const [person, setPerson] = createSignal<Person | null>(null)
   const label = { installer: "Installed Bank", added: "Added", slack: "Slack admin" } as const
   return (
-    <Panel overflow title="Admins" description="Whoever installed Bank and your Slack admins are admins automatically.">
+    <Panel overflow title="Admins" description="Whoever installed Bank, plus anyone an admin adds here. Slack admins aren't admins here unless added.">
       <div class="border-t divider">
         <Show when={admins()} fallback={<Empty>Loading…</Empty>}>
           <For each={admins()}>

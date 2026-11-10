@@ -454,8 +454,8 @@ export class Workspace extends DurableObject<Env> {
   }
 
   private isAdmin(id: string) {
-    if (this.sql.exec("select 1 from admins where id = ?", id).toArray().length) return true
-    return this.row(id)?.slack_admin === 1
+    // Only the installer and people an admin added. Slack workspace admins get no say over the ledger by default.
+    return this.sql.exec("select 1 from admins where id = ?", id).toArray().length > 0
   }
 
   // ---------- install and sign in
@@ -631,9 +631,7 @@ export class Workspace extends DurableObject<Env> {
   async admins(viewer: Viewer): Promise<Admin[]> {
     this.assertAdmin(viewer)
     const added = this.sql.exec<{ id: string; source: "installer" | "added" }>("select id, source from admins").toArray()
-    const slackAdmins = this.sql.exec<{ id: string }>("select id from accounts where slack_admin = 1").toArray()
     const result = new Map<string, Admin>()
-    for (const { id } of slackAdmins) result.set(id, { id, name: id, image: null, source: "slack" })
     for (const { id, source } of added) result.set(id, { id, name: id, image: null, source })
     for (const admin of result.values()) {
       const row = this.row(admin.id)
