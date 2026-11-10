@@ -63,7 +63,10 @@ export async function verified(request: Request, secret: string) {
   const signature = request.headers.get("x-slack-signature")
   if (!timestamp || !signature) return null
   if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return null
+  // Slack's payloads are a few KB; refuse to buffer anything big before the signature is checked.
+  if (Number(request.headers.get("content-length") ?? 0) > 64 * 1024) return null
   const body = await request.text()
+  if (body.length > 64 * 1024) return null
   const expected = "v0=" + hex(await hmac(secret, `v0:${timestamp}:${body}`))
   return equal(expected, signature) ? body : null
 }

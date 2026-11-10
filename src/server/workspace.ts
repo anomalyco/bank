@@ -38,6 +38,7 @@ type AccountRow = {
   received: number
   given: number
   slack_admin: number
+  gone: number
 }
 
 type EntryRow = {
@@ -92,6 +93,11 @@ export type EventEnvelope = {
     | MemberEvent
     | { type: "channel_created"; channel: { id: string } }
     | { type: "app_uninstalled" | "tokens_revoked" }
+}
+
+/** User-written text goes into Slack messages escaped, so it can't ping @channel, mention people or fake links. */
+function escape(text: string) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
 const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
@@ -423,12 +429,19 @@ export class Workspace extends DurableObject<Env> {
   // ---------- install and sign in
 
   async installed(data: Omit<Install, "installedAt">): Promise<Viewer> {
-    this.setMeta("install", { ...data, installedAt: Date.now() } satisfies Install)
-    this.sql.exec(
-      "insert or replace into admins (id, source, added_by, at) values (?, 'installer', null, ?)",
-      data.installer,
-      Date.now(),
-    )
+    // Only the first install makes someone an admin. Otherwise any member allowed to install apps could re-run the
+    // install to promote themselves.
+    const first = !this.install()
+    this.setMeta("install", { ...data, installer: this.install()?.installer ?? data.installer, installedAt: Date.now() } satisfies Install)
+    if (first) {
+      this.sql.exec(
+        "insert or ignore into admins (id, source, added_by, at) values (?, 'installer', null, ?)",
+        data.installer,
+        Date.now(),
+      )
+    } else {
+      console.log("reinstall", { by: data.installer })
+    }
     await this.syncMembers().catch((error) => console.error("sync failed", error))
     this.ctx.waitUntil(this.joinPublicChannels().catch((error) => console.error("join failed", error)))
     const accounts = await this.ensure([data.installer])
@@ -516,7 +529,8 @@ export class Workspace extends DurableObject<Env> {
   }
 
   async give(viewer: Viewer, to: string, amount: number, note: string | null) {
-    const result = await this.transfer(viewer.id, to, amount, note, "give")
+    this.assertActive(viewer)
+    const result = await this.transfer(viewer.id, to, amount, note?.slice(0, 280) ?? null, "give")
     if (!result.ok) throw new Error(result.message)
     return { balance: result.balance }
   }
@@ -524,7 +538,13 @@ export class Workspace extends DurableObject<Env> {
   // ---------- admin
 
   private assertAdmin(viewer: Viewer) {
+    this.assertActive(viewer)
     if (!this.isAdmin(viewer.id)) throw new Error("forbidden")
+  }
+
+  /** Web sessions last 30 days; people deactivated in Slack lose access right away. */
+  private assertActive(viewer: Viewer) {
+    if (this.row(viewer.id)?.gone) throw new Error("forbidden")
   }
 
   async saveConfig(viewer: Viewer, input: Config): Promise<Config> {
@@ -537,8 +557,8 @@ export class Workspace extends DurableObject<Env> {
       .filter((item) => !names.has(item.name) && names.add(item.name))
       .slice(0, 24)
     const config: Config = {
-      singular: clean(input.singular, 32) || defaultConfig.singular,
-      plural: clean(input.plural, 32) || defaultConfig.plural,
+      singular: clean(input.singular, 32).replace(/[<>&*_~`]/g, "") || defaultConfig.singular,
+      plural: clean(input.plural, 32).replace(/[<>&*_~`]/g, "") || defaultConfig.plural,
       symbol: EMOJI_NAME.test(clean(input.symbol, 100).replace(/^:|:$/g, "").toLowerCase())
         ? clean(input.symbol, 100).replace(/^:|:$/g, "").toLowerCase()
         : defaultConfig.symbol,
@@ -553,7 +573,10 @@ export class Workspace extends DurableObject<Env> {
   async adjust(viewer: Viewer, target: string, amount: number, note: string | null) {
     this.assertAdmin(viewer)
     amount = Math.trunc(amount)
-    if (!amount) throw new Error("amount must not be zero")
+    if (!Number.isSafeInteger(amount) || !amount) throw new Error("amount must be a whole number other than zero")
+    if (Math.abs(amount) > 1_000_000) throw new Error("adjust at most 1,000,000 at a time")
+    note = note?.slice(0, 280) ?? null
+    console.log("adjust", { by: viewer.id, target, amount })
     const accounts = await this.ensure([target])
     if (!accounts.get(target)) throw new Error("unknown person")
     const result =
@@ -662,8 +685,18 @@ export class Workspace extends DurableObject<Env> {
     link: string | null = null,
   ): Promise<{ ok: true; balance: number } | { ok: false; message: string }> {
     const config = this.config()
-    if (!Number.isInteger(amount) || amount <= 0) return { ok: false, message: "the amount has to be a whole number above 0" }
+    if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, message: "the amount has to be a whole number above 0" }
     if (from === to) return { ok: false, message: `you can't give ${config.plural} to yourself` }
+    if (this.row(from)?.gone) return { ok: false, message: "your account is deactivated" }
+    // At most 30 gifts a minute per person, so nobody can flood a channel.
+    const recent = this.sql
+      .exec<{ n: number }>(
+        "select count(*) as n from entries where from_id = ? and kind in ('give', 'reaction') and at > ?",
+        from,
+        Date.now() - 60_000,
+      )
+      .one().n
+    if (recent >= 30) return { ok: false, message: "slow down, try again in a minute" }
     const accounts = await this.ensure([from, to])
     const recipient = accounts.get(to)
     if (!accounts.get(from)) return { ok: false, message: "couldn't look you up in slack, try again" }
@@ -682,7 +715,11 @@ export class Workspace extends DurableObject<Env> {
     return { ok: true, balance: result.from ?? 0 }
   }
 
-  async command(params: { text: string; user_id: string }): Promise<SlackMessage> {
+  async command(params: { text: string; user_id: string; request: string }): Promise<SlackMessage> {
+    const fresh = this.sql
+      .exec("insert or ignore into events (id, at) values (?, ?)", `command:${params.request}`, Date.now()).rowsWritten
+    if (!fresh) return { response_type: "ephemeral", text: "already handled" }
+    console.log("command", { user: params.user_id, text: params.text.slice(0, 200) })
     const config = this.config()
     const text = params.text.trim()
     const words = text.split(/\s+/).filter(Boolean)
@@ -713,7 +750,7 @@ export class Workspace extends DurableObject<Env> {
       if (!rows.length) return reply("nothing yet")
       const lines = rows.map((row) => {
         const amount = currency(config, row.amount)
-        const note = row.note ? ` · ${row.note}` : ""
+        const note = row.note ? ` · ${escape(row.note)}` : ""
         if (row.kind === "grant") return `+${amount} starting balance`
         if (row.kind === "adjust") return row.to_id === params.user_id ? `+${amount} from an admin${note}` : `-${amount} by an admin${note}`
         if (row.kind === "refund") return row.to_id === params.user_id ? `+${amount} refunded by <@${row.from_id}>` : `-${amount} refunded to <@${row.to_id}>`
@@ -742,7 +779,7 @@ export class Workspace extends DurableObject<Env> {
     if (!result.ok) return reply(result.message)
     return {
       response_type: "in_channel",
-      text: `:${config.symbol}: <@${params.user_id}> gave <@${to}> *${currency(config, amount)}*${note ? ` · ${note}` : ""}`.trim(),
+      text: `:${config.symbol}: <@${params.user_id}> gave <@${to}> *${currency(config, amount)}*${note ? ` · ${escape(note)}` : ""}`.trim(),
     }
   }
 

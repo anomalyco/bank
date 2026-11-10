@@ -101,7 +101,9 @@ function errorFromUrl() {
   if (!error) return null
   if (error === "access_denied") return "Slack sign in was cancelled."
   if (error === "state") return "That sign in link expired, try again."
-  return error
+  if (error === "org_install") return "Bank can't be installed across a whole Enterprise Grid org yet. Install it in one workspace."
+  // Never echo the parameter itself: a crafted link could make the page say anything.
+  return "Something went wrong signing in with Slack. Try again."
 }
 
 // ---------- signed out

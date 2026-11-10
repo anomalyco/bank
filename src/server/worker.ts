@@ -184,7 +184,12 @@ async function command(request: Request, env: Env, ctx: ExecutionContext) {
   const team = params.team_id
   if (!team || !params.user_id) return new Response("bad request", { status: 400 })
   void ctx
-  const message = await workspace(env, team).command({ text: params.text ?? "", user_id: params.user_id })
+  const message = await workspace(env, team).command({
+    text: params.text ?? "",
+    user_id: params.user_id,
+    // A signed request can be replayed within Slack's five-minute window; the signature identifies it.
+    request: request.headers.get("x-slack-signature") ?? "",
+  })
   return json(message)
 }
 
@@ -260,8 +265,23 @@ async function asset(request: Request, env: Env, path: string) {
   })
 }
 
+function secure(response: Response) {
+  const headers = new Headers(response.headers)
+  headers.set("x-content-type-options", "nosniff")
+  headers.set("x-frame-options", "DENY")
+  headers.set("content-security-policy", "frame-ancestors 'none'")
+  headers.set("referrer-policy", "same-origin")
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
 export default {
   async fetch(request, env, ctx) {
+    return secure(await handle(request, env, ctx))
+  },
+} satisfies ExportedHandler<Env>
+
+async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  {
     const url = new URL(request.url)
     if (url.pathname === BASE) return redirect(`${BASE}/${url.search}`)
     const path = url.pathname.slice(BASE.length)
@@ -280,7 +300,7 @@ export default {
       const message = error instanceof Error ? error.message : String(error)
       console.error("request failed", path, error)
       if (path.startsWith("/api/")) return json({ error: message.replace(/^Error: /, "") }, message === "forbidden" ? 403 : 400)
-      return redirect(`${BASE}/?error=${encodeURIComponent(message)}`)
+      return redirect(`${BASE}/?error=failed`)
     }
-  },
-} satisfies ExportedHandler<Env>
+  }
+}
