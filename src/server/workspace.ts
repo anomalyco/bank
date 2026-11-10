@@ -279,6 +279,94 @@ export class Workspace extends DurableObject<Env> {
     })
   }
 
+  /**
+   * Opens an account for every full member of the workspace, each with the starting grant, and refreshes names and
+   * photos for everyone already known. Guests, bots and deactivated people are left out until they use Bank.
+   */
+  private async syncMembers() {
+    const members: Profile[] = []
+    let cursor: string | undefined
+    do {
+      const page = await this.call<{
+        members: {
+          id: string
+          name: string
+          deleted?: boolean
+          is_bot?: boolean
+          is_app_user?: boolean
+          is_restricted?: boolean
+          is_ultra_restricted?: boolean
+          is_admin?: boolean
+          is_owner?: boolean
+          profile?: { display_name?: string; real_name?: string; image_72?: string }
+        }[]
+        response_metadata?: { next_cursor?: string }
+      }>("users.list", { limit: 200, cursor })
+      for (const member of page.members) {
+        if (member.deleted || member.is_bot || member.is_app_user || member.id === "USLACKBOT") continue
+        if (member.is_restricted || member.is_ultra_restricted) continue
+        members.push({
+          id: member.id,
+          name: member.profile?.display_name || member.profile?.real_name || member.name,
+          image: member.profile?.image_72 ?? null,
+          bot: false,
+          deleted: false,
+          admin: Boolean(member.is_admin || member.is_owner),
+        })
+      }
+      cursor = page.response_metadata?.next_cursor || undefined
+    } while (cursor)
+
+    const config = this.config()
+    const now = Date.now()
+    this.ctx.storage.transactionSync(() => {
+      for (const member of members) {
+        const created = this.sql.exec(
+          "insert or ignore into accounts (id, name, image, bot, slack_admin, created_at) values (?, ?, ?, 0, ?, ?)",
+          member.id,
+          member.name,
+          member.image,
+          member.admin ? 1 : 0,
+          now,
+        ).rowsWritten
+        if (!created) {
+          this.sql.exec(
+            "update accounts set name = ?, image = ?, slack_admin = ? where id = ?",
+            member.name,
+            member.image,
+            member.admin ? 1 : 0,
+            member.id,
+          )
+          continue
+        }
+        if (config.starting <= 0) continue
+        this.sql.exec("update accounts set balance = ? where id = ?", config.starting, member.id)
+        this.sql.exec(
+          "insert into entries (at, kind, to_id, amount, note) values (?, 'grant', ?, ?, 'starting balance')",
+          now,
+          member.id,
+          config.starting,
+        )
+      }
+    })
+    this.setMeta("synced", now)
+    return members.length
+  }
+
+  /** Syncs members when it has never happened (waiting for it), or in the background when the last sync is stale. */
+  private async freshen() {
+    if (!this.install()?.token) return
+    const synced = this.meta<number>("synced")
+    if (!synced) {
+      await this.syncMembers().catch((error) => console.error("sync failed", error))
+      return
+    }
+    if (Date.now() - synced > 60 * 60 * 1000) {
+      this.setMeta("synced", Date.now())
+      this.ctx.waitUntil(this.syncMembers().catch((error) => console.error("sync failed", error)))
+    }
+  }
+
   private isAdmin(id: string) {
     if (this.sql.exec("select 1 from admins where id = ?", id).toArray().length) return true
     return this.row(id)?.slack_admin === 1
@@ -293,6 +381,7 @@ export class Workspace extends DurableObject<Env> {
       data.installer,
       Date.now(),
     )
+    await this.syncMembers().catch((error) => console.error("sync failed", error))
     const accounts = await this.ensure([data.installer])
     const row = accounts.get(data.installer)
     return { id: data.installer, name: row?.name ?? "someone", image: row?.image ?? null }
@@ -319,6 +408,7 @@ export class Workspace extends DurableObject<Env> {
   }
 
   async me(viewer: Viewer, team: { id: string; name: string; domain: string | null; icon: string | null }): Promise<Me> {
+    await this.freshen()
     const install = this.install()
     const row = this.row(viewer.id)
     return {
@@ -334,6 +424,7 @@ export class Workspace extends DurableObject<Env> {
   }
 
   async leaderboard() {
+    await this.freshen()
     return {
       accounts: this.sql
         .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc, name asc limit 500")
@@ -543,6 +634,7 @@ export class Workspace extends DurableObject<Env> {
     }
 
     if (sub === "top" || sub === "leaderboard") {
+      await this.freshen()
       const rows = this.sql
         .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc limit 10")
         .toArray()
