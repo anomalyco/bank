@@ -51,6 +51,20 @@ type EntryRow = {
   link: string | null
 }
 
+type SlackMember = {
+  id: string
+  name: string
+  real_name?: string
+  deleted?: boolean
+  is_bot?: boolean
+  is_app_user?: boolean
+  is_restricted?: boolean
+  is_ultra_restricted?: boolean
+  is_admin?: boolean
+  is_owner?: boolean
+  profile?: { display_name?: string; real_name?: string; image_72?: string }
+}
+
 type Profile = { id: string; name: string; image: string | null; bot: boolean; deleted: boolean; admin: boolean }
 
 type Move =
@@ -69,7 +83,7 @@ type ReactionEvent = {
 
 export type EventEnvelope = {
   event_id: string
-  event: { type: string } & Partial<Omit<ReactionEvent, "type">>
+  event: { type: string }
 }
 
 const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
@@ -115,6 +129,10 @@ export class Workspace extends DurableObject<Env> {
       create table if not exists admins (id text primary key, source text not null, added_by text, at integer not null);
       create table if not exists events (id text primary key, at integer not null);
     `)
+    const columns = this.sql.exec<{ name: string }>("pragma table_info(accounts)").toArray()
+    if (!columns.some((column) => column.name === "gone")) {
+      this.sql.exec("alter table accounts add column gone integer not null default 0")
+    }
   }
 
   // ---------- storage helpers
@@ -280,80 +298,73 @@ export class Workspace extends DurableObject<Env> {
   }
 
   /**
-   * Opens an account for every full member of the workspace, each with the starting grant, and refreshes names and
-   * photos for everyone already known. Guests, bots and deactivated people are left out until they use Bank.
+   * Applies one Slack member to the ledger. Full members get an account with the starting grant the first time they're
+   * seen; known accounts get their name, photo and admin flag refreshed. Deactivated people drop off the leaderboard but
+   * keep their balance. Guests only get an account once they use Bank, and bots never do.
    */
+  private applyMember(member: SlackMember, config: Config, now: number) {
+    if (member.is_bot || member.is_app_user || member.id === "USLACKBOT") return
+    const name = member.profile?.display_name || member.profile?.real_name || member.real_name || member.name
+    const image = member.profile?.image_72 ?? null
+    const admin = member.is_admin || member.is_owner ? 1 : 0
+    const gone = member.deleted ? 1 : 0
+    const known = this.row(member.id)
+    if (known || gone || member.is_restricted || member.is_ultra_restricted) {
+      if (known) {
+        this.sql.exec(
+          "update accounts set name = ?, image = ?, slack_admin = ?, gone = ? where id = ?",
+          name,
+          image,
+          admin,
+          gone,
+          member.id,
+        )
+      }
+      return
+    }
+    this.sql.exec(
+      "insert into accounts (id, name, image, bot, slack_admin, created_at) values (?, ?, ?, 0, ?, ?)",
+      member.id,
+      name,
+      image,
+      admin,
+      now,
+    )
+    if (config.starting <= 0) return
+    this.sql.exec("update accounts set balance = ? where id = ?", config.starting, member.id)
+    this.sql.exec(
+      "insert into entries (at, kind, to_id, amount, note) values (?, 'grant', ?, ?, 'starting balance')",
+      now,
+      member.id,
+      config.starting,
+    )
+  }
+
+  /** Reads the whole member list from Slack and applies everyone. */
   private async syncMembers() {
-    const members: Profile[] = []
+    const members: SlackMember[] = []
     let cursor: string | undefined
     do {
-      const page = await this.call<{
-        members: {
-          id: string
-          name: string
-          deleted?: boolean
-          is_bot?: boolean
-          is_app_user?: boolean
-          is_restricted?: boolean
-          is_ultra_restricted?: boolean
-          is_admin?: boolean
-          is_owner?: boolean
-          profile?: { display_name?: string; real_name?: string; image_72?: string }
-        }[]
-        response_metadata?: { next_cursor?: string }
-      }>("users.list", { limit: 200, cursor })
-      for (const member of page.members) {
-        if (member.deleted || member.is_bot || member.is_app_user || member.id === "USLACKBOT") continue
-        if (member.is_restricted || member.is_ultra_restricted) continue
-        members.push({
-          id: member.id,
-          name: member.profile?.display_name || member.profile?.real_name || member.name,
-          image: member.profile?.image_72 ?? null,
-          bot: false,
-          deleted: false,
-          admin: Boolean(member.is_admin || member.is_owner),
-        })
-      }
+      const page = await this.call<{ members: SlackMember[]; response_metadata?: { next_cursor?: string } }>(
+        "users.list",
+        { limit: 200, cursor },
+      )
+      members.push(...page.members)
       cursor = page.response_metadata?.next_cursor || undefined
     } while (cursor)
-
     const config = this.config()
     const now = Date.now()
     this.ctx.storage.transactionSync(() => {
-      for (const member of members) {
-        const created = this.sql.exec(
-          "insert or ignore into accounts (id, name, image, bot, slack_admin, created_at) values (?, ?, ?, 0, ?, ?)",
-          member.id,
-          member.name,
-          member.image,
-          member.admin ? 1 : 0,
-          now,
-        ).rowsWritten
-        if (!created) {
-          this.sql.exec(
-            "update accounts set name = ?, image = ?, slack_admin = ? where id = ?",
-            member.name,
-            member.image,
-            member.admin ? 1 : 0,
-            member.id,
-          )
-          continue
-        }
-        if (config.starting <= 0) continue
-        this.sql.exec("update accounts set balance = ? where id = ?", config.starting, member.id)
-        this.sql.exec(
-          "insert into entries (at, kind, to_id, amount, note) values (?, 'grant', ?, ?, 'starting balance')",
-          now,
-          member.id,
-          config.starting,
-        )
-      }
+      for (const member of members) this.applyMember(member, config, now)
     })
     this.setMeta("synced", now)
     return members.length
   }
 
-  /** Syncs members when it has never happened (waiting for it), or in the background when the last sync is stale. */
+  /**
+   * Slack pushes joins and profile changes as events. This full sync only runs the first time and then daily, in the
+   * background, as a safety net for events Slack failed to deliver.
+   */
   private async freshen() {
     if (!this.install()?.token) return
     const synced = this.meta<number>("synced")
@@ -361,7 +372,7 @@ export class Workspace extends DurableObject<Env> {
       await this.syncMembers().catch((error) => console.error("sync failed", error))
       return
     }
-    if (Date.now() - synced > 60 * 60 * 1000) {
+    if (Date.now() - synced > 24 * 60 * 60 * 1000) {
       this.setMeta("synced", Date.now())
       this.ctx.waitUntil(this.syncMembers().catch((error) => console.error("sync failed", error)))
     }
@@ -427,7 +438,7 @@ export class Workspace extends DurableObject<Env> {
     await this.freshen()
     return {
       accounts: this.sql
-        .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc, name asc limit 500")
+        .exec<AccountRow>("select * from accounts where bot = 0 and gone = 0 order by balance desc, received desc, name asc limit 500")
         .toArray()
         .map((row) => this.account(row)),
     }
@@ -636,7 +647,7 @@ export class Workspace extends DurableObject<Env> {
     if (sub === "top" || sub === "leaderboard") {
       await this.freshen()
       const rows = this.sql
-        .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc limit 10")
+        .exec<AccountRow>("select * from accounts where bot = 0 and gone = 0 order by balance desc, received desc limit 10")
         .toArray()
       if (!rows.length) return reply("nobody has any yet")
       const lines = rows.map((row, i) => `${i + 1}. <@${row.id}> · ${currency(config, row.balance)}`)
@@ -710,6 +721,11 @@ export class Workspace extends DurableObject<Env> {
     if (!this.install()?.token) return
     if (event.type === "reaction_added" || event.type === "reaction_removed") {
       return this.reaction(event as ReactionEvent)
+    }
+    if (event.type === "team_join" || event.type === "user_change") {
+      const member = (event as { user: SlackMember }).user
+      const config = this.config()
+      this.ctx.storage.transactionSync(() => this.applyMember(member, config, Date.now()))
     }
   }
 

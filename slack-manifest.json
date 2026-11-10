@@ -20,15 +20,21 @@
         "command": "/bank",
         "url": "https://anoma.ly/labs/bank/slack/commands",
         "description": "Give coins, check your balance, see the leaderboard",
-        "usage_hint": "give @someone 10 for the fix · balance · top · history",
+        "usage_hint": "give @someone 10 for the fix \u00b7 balance \u00b7 top \u00b7 history",
         "should_escape": true
       }
     ]
   },
   "oauth_config": {
-    "redirect_urls": ["https://anoma.ly/labs/bank/auth/install", "https://anoma.ly/labs/bank/auth/login"],
+    "redirect_urls": [
+      "https://anoma.ly/labs/bank/auth/install",
+      "https://anoma.ly/labs/bank/auth/login"
+    ],
     "scopes": {
-      "user": ["openid", "profile"],
+      "user": [
+        "openid",
+        "profile"
+      ],
       "bot": [
         "commands",
         "chat:write",
@@ -45,7 +51,14 @@
   "settings": {
     "event_subscriptions": {
       "request_url": "https://anoma.ly/labs/bank/slack/events",
-      "bot_events": ["reaction_added", "reaction_removed", "app_uninstalled", "tokens_revoked"]
+      "bot_events": [
+        "reaction_added",
+        "reaction_removed",
+        "app_uninstalled",
+        "tokens_revoked",
+        "team_join",
+        "user_change"
+      ]
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": false,
