@@ -22,14 +22,85 @@ body {
   color: var(--v2-text-text-base);
   font-family: var(--font-family-sans);
   font-size: 13px;
+  font-weight: 440;
   line-height: 20px;
+  letter-spacing: -0.04px;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-.surface {
+button {
+  font: inherit;
+  color: inherit;
+}
+
+.page {
+  width: 100%;
+  margin-inline: auto;
+  padding-inline: 20px;
+  box-sizing: border-box;
+}
+
+@media (max-width: 480px) {
+  .page {
+    padding-inline: 12px;
+  }
+}
+
+.brand {
+  font-size: 15px;
+  line-height: 20px;
+  font-weight: 600;
+  letter-spacing: -0.13px;
+}
+
+.card {
   background: var(--v2-background-bg-base);
-  border: 1px solid var(--v2-border-border-muted);
-  border-radius: 12px;
+  border: 0.5px solid var(--v2-border-border-base);
+  border-radius: 10px;
+  box-shadow: var(--v2-elevation-raised);
+}
+
+/* A recessed area inside a card, for lists that sit within a card's padding. */
+.inset {
+  background: var(--v2-background-bg-layer-01);
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 0.5px solid var(--v2-border-border-muted);
+  background: var(--v2-background-bg-layer-01);
+  border-radius: 0 0 10px 10px;
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 8px;
+}
+
+.divider {
+  border-color: var(--v2-border-border-muted);
+  border-top-width: 0.5px;
+}
+
+.bg-subtle {
+  background: var(--v2-background-bg-layer-01);
+}
+
+.strong {
+  font-weight: 530;
+  color: var(--v2-text-text-base);
 }
 
 .muted {
@@ -49,23 +120,21 @@ body {
 }
 
 .row {
-  border-top: 1px solid var(--v2-border-border-muted);
+  border-top: 0.5px solid var(--v2-border-border-muted);
 }
 
 .row:first-child {
   border-top: none;
 }
 
-.title {
-  font-size: 15px;
-  line-height: 20px;
-  font-weight: 600;
+.row.self {
+  background: var(--v2-background-bg-layer-01);
 }
 
 .display {
   font-size: 44px;
   line-height: 48px;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -1.2px;
   font-variant-numeric: tabular-nums;
 }
@@ -73,8 +142,16 @@ body {
 .hero {
   font-size: 40px;
   line-height: 44px;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -1px;
+  text-wrap: balance;
+}
+
+@media (max-width: 480px) {
+  .hero {
+    font-size: 32px;
+    line-height: 36px;
+  }
 }
 
 .num {
@@ -84,9 +161,14 @@ body {
 .code {
   font-family: var(--font-family-mono);
   font-size: 12px;
-  background: var(--v2-background-bg-layer-01);
+  line-height: 18px;
+  color: var(--v2-text-text-base);
+  background: var(--v2-background-bg-layer-02);
+  border: 0.5px solid var(--v2-border-border-muted);
   border-radius: 4px;
-  padding: 1px 5px;
+  padding: 0 4px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
 
 .link {
@@ -98,25 +180,233 @@ body {
   color: var(--v2-text-text-accent-hover);
 }
 
+a[data-component="button-v2"] {
+  text-decoration: none;
+}
+
+/* Tabs: the component fills its parent's height by default; here it is just the strip. */
+.tabs[data-component="tabs-v2"] {
+  height: auto;
+}
+
+.tabs [data-slot="tabs-v2-list"] {
+  padding-inline: 0 !important;
+  gap: 4px !important;
+  height: 36px !important;
+}
+
+.tabs [data-slot="tabs-v2-list"]::before {
+  width: 100% !important;
+  inset-inline-start: 0 !important;
+  background-color: var(--v2-border-border-muted) !important;
+}
+
+.tabs [data-slot="tabs-v2-trigger-wrapper"] {
+  cursor: pointer;
+  border-bottom-width: 1.5px !important;
+}
+
+.tabs [data-slot="tabs-v2-trigger-wrapper"]:has([data-selected]) {
+  border-bottom-color: var(--v2-text-text-base) !important;
+}
+
+.tabs [data-slot="tabs-v2-trigger"] {
+  padding: 6px 8px !important;
+  cursor: pointer;
+}
+
+.tabs [data-slot="tabs-v2-trigger-wrapper"]:has([data-selected]) [data-slot="tabs-v2-trigger"] {
+  font-weight: 530;
+}
+
+/* Person picker */
+.popover {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  padding: 4px;
+  background: var(--v2-background-bg-base);
+  border: 0.5px solid var(--v2-border-border-base);
+  border-radius: 8px;
+  box-shadow: var(--v2-elevation-floating);
+  max-height: 280px;
+  overflow: auto;
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.option[aria-selected="true"] {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+.chosen {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+  padding: 0 2px 0 8px;
+  border-radius: 6px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: var(--v2-elevation-input);
+}
+
+/* Emoji */
 .emoji {
   width: 20px;
   height: 20px;
   object-fit: contain;
 }
 
+.emoji-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+}
+
+.emoji-missing {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1px dashed var(--v2-border-border-strong);
+  color: var(--v2-text-text-faint);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
+  gap: 2px;
+  padding: 6px;
+  max-height: 228px;
+  overflow: auto;
+}
+
 .pick {
-  border: 1px solid transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  border: 0;
   border-radius: 6px;
   background: none;
-  padding: 4px;
+  padding: 0;
   cursor: pointer;
+  position: relative;
 }
 
 .pick:hover {
   background: var(--v2-overlay-simple-overlay-hover);
-  border-color: var(--v2-border-border-muted);
 }
 
-a[data-component="button-v2"] {
+.pick[aria-pressed="true"] {
+  background: var(--v2-background-bg-base);
+  box-shadow: inset 0 0 0 1.5px var(--v2-border-border-focus);
+}
+
+.pick:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}
+
+.pick .emoji {
+  width: 22px;
+  height: 22px;
+}
+
+.emoji-popover {
+  right: auto;
+  width: min(320px, calc(100vw - 40px));
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: none;
+  overflow: visible;
+}
+
+.emoji-popover .picker {
+  padding: 0;
+  max-height: 216px;
+}
+
+/* Suggested coin pack */
+
+.coin {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 4px 8px;
+  border-radius: 8px;
   text-decoration: none;
+  color: var(--v2-text-text-muted);
+  background: var(--v2-background-bg-layer-01);
+  border: 0.5px solid var(--v2-border-border-muted);
+  transition: background 85ms ease-out;
+}
+
+.coin:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+  color: var(--v2-text-text-base);
+}
+
+.coin img {
+  display: block;
+  object-fit: contain;
+}
+
+.coin-action {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--v2-text-text-faint);
+}
+
+.coin:hover .coin-action {
+  color: var(--v2-text-text-accent);
+}
+
+.coin-name {
+  font-family: var(--font-family-mono);
+  font-size: 11px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.bank-avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+}
+
+[data-component="tag"] {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
