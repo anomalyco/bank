@@ -221,6 +221,12 @@ async function api(request: Request, env: Env, path: string) {
   const body = async <T>() => (await request.json()) as T
   const route = `${request.method} ${path}`
 
+  // The app's operator (dax in Anomaly) can look up installs by Durable Object id, as listed by `cf durable-objects`.
+  if (route === "GET /operator/workspaces") {
+    if (viewer.id !== "U065BMCVB8F" || viewer.team.id !== "T0HJ2SVJ4") throw new HttpError(404, "not found")
+    const ids = (new URL(request.url).searchParams.get("ids") ?? "").split(",").filter((id) => /^[0-9a-f]{64}$/.test(id))
+    return Promise.all(ids.map(async (id) => ({ id, ...(await env.WORKSPACES.get(env.WORKSPACES.idFromString(id)).summary()) })))
+  }
   if (route === "GET /me") return ws.me(user, viewer.team)
   if (route === "GET /leaderboard") return ws.leaderboard()
   if (route === "GET /history") return ws.history(user, "mine")

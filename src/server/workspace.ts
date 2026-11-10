@@ -498,14 +498,34 @@ export class Workspace extends DurableObject<Env> {
         data.installer,
         Date.now(),
       )
+      console.log("install", { team: data.teamId, name: data.teamName, domain: data.domain, by: data.installer })
     } else {
-      console.log("reinstall", { by: data.installer })
+      console.log("reinstall", { team: data.teamId, name: data.teamName, by: data.installer })
     }
     await this.syncMembers().catch((error) => console.error("sync failed", error))
     this.ctx.waitUntil(this.joinPublicChannels().catch((error) => console.error("join failed", error)))
     const accounts = await this.ensure([data.installer])
     const row = accounts.get(data.installer)
     return { id: data.installer, name: row?.name ?? "someone", image: row?.image ?? null }
+  }
+
+  /** What the operator sees about a workspace: no balances or notes, just who installed it and how big it is. */
+  async summary() {
+    const install = this.install()
+    const counts = this.sql
+      .exec<{ accounts: number; entries: number }>(
+        "select (select count(*) from accounts where gone = 0 and bot = 0) as accounts, (select count(*) from entries) as entries",
+      )
+      .one()
+    return {
+      team: install?.teamId ?? null,
+      name: install?.teamName ?? null,
+      domain: install?.domain ?? null,
+      installer: install?.installer ?? null,
+      installedAt: install?.installedAt ?? null,
+      active: Boolean(install?.token),
+      ...counts,
+    }
   }
 
   async uninstalled() {
