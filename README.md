@@ -7,7 +7,7 @@ Live at https://anoma.ly/labs/bank.
 ## How it works
 
 - `/bank give @someone 10 for the fix`, `/bank balance`, `/bank top`, `/bank history`
-- React to a message with a coin emoji (`:coin-1:`, `:coin-5:`, `:coin-10:`, `:coin-20:` by default) to give that many. Removing the reaction refunds it.
+- React to a message with a coin emoji (`:coin-1:`, `:coin-5:`, `:coin-10:`, `:coin-20:` by default) to give that many. A gift is final: removing the reaction doesn't take it back, and adding it again doesn't give again.
 - Admins (whoever installed it, Slack admins, and anyone they add) can rename the currency, set the starting balance, map any custom emoji to an amount, adjust balances, and join every public channel.
 
 Slack doesn't let apps upload custom emoji, so workspaces add the coin images themselves. The default pack is in `public/emoji` (rendered by `scripts/emoji.ts`).

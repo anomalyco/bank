@@ -739,32 +739,25 @@ export class Workspace extends DurableObject<Env> {
     const ts = event.item.ts
     const to = event.item_user
     if (!value || event.item.type !== "message" || !channel || !ts || !to || to === event.user) return
+    // A reaction gift is final: removing the reaction doesn't take it back, and adding it again doesn't give again.
+    if (event.type === "reaction_removed") return
     const key = `${channel}:${ts}:${event.user}:${name}`
-
-    if (event.type === "reaction_removed") {
-      const gift = this.sql
-        .exec<{ from_id: string; to_id: string; amount: number }>("select * from reactions where key = ?", key)
-        .toArray()[0]
-      if (!gift) return
-      this.sql.exec("delete from reactions where key = ?", key)
-      const result = this.move({
-        from: gift.to_id,
-        to: gift.from_id,
-        amount: gift.amount,
-        kind: "refund",
-        note: `removed :${name}:`,
-        actor: gift.from_id,
-      })
-      if (!result.ok) console.log("refund skipped", key, result.reason)
-      return
-    }
-
-    if (this.sql.exec("select 1 from reactions where key = ?", key).toArray().length) return
+    // Claim the gift before any await, so a quick remove-and-re-add can't give twice.
+    const claimed = this.sql.exec(
+      "insert or ignore into reactions (key, from_id, to_id, amount) values (?, ?, ?, ?)",
+      key,
+      event.user,
+      to,
+      value.amount,
+    ).rowsWritten
+    if (!claimed) return
     const link = await this.call<{ permalink: string }>("chat.getPermalink", { channel, message_ts: ts })
       .then((result) => result.permalink)
       .catch(() => null)
     const result = await this.transfer(event.user, to, value.amount, null, "reaction", link)
     if (!result.ok) {
+      // Nothing moved, so let them try again once they have enough.
+      this.sql.exec("delete from reactions where key = ?", key)
       await this.call("chat.postEphemeral", {
         channel,
         user: event.user,
@@ -772,13 +765,6 @@ export class Workspace extends DurableObject<Env> {
       }).catch((error) => console.error("ephemeral failed", error))
       return
     }
-    this.sql.exec(
-      "insert or replace into reactions (key, from_id, to_id, amount) values (?, ?, ?, ?)",
-      key,
-      event.user,
-      to,
-      value.amount,
-    )
     if (config.notify) {
       const where = link ? ` for <${link}|your message>` : ""
       await this.call("chat.postMessage", {
