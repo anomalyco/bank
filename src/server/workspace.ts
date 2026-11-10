@@ -81,9 +81,12 @@ type ReactionEvent = {
   item: { type: string; channel?: string; ts?: string }
 }
 
+type MemberEvent = { type: "team_join" | "user_change"; user: SlackMember }
+
+/** The events the app subscribes to (see slack-manifest.json). */
 export type EventEnvelope = {
   event_id: string
-  event: { type: string }
+  event: ReactionEvent | MemberEvent | { type: "app_uninstalled" | "tokens_revoked" }
 }
 
 const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
@@ -720,12 +723,11 @@ export class Workspace extends DurableObject<Env> {
     if (event.type === "app_uninstalled" || event.type === "tokens_revoked") return this.uninstalled()
     if (!this.install()?.token) return
     if (event.type === "reaction_added" || event.type === "reaction_removed") {
-      return this.reaction(event as ReactionEvent)
+      return this.reaction(event)
     }
     if (event.type === "team_join" || event.type === "user_change") {
-      const member = (event as { user: SlackMember }).user
       const config = this.config()
-      this.ctx.storage.transactionSync(() => this.applyMember(member, config, Date.now()))
+      this.ctx.storage.transactionSync(() => this.applyMember(event.user, config, Date.now()))
     }
   }
 
