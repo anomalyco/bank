@@ -386,7 +386,7 @@ function describe(entry: Entry, history: History, viewer: string | null) {
 
 const page = 30
 
-function ActivityList(props: { history: History | undefined; me: Me; viewer: string | null }) {
+function ActivityList(props: { history: History | undefined; me: Me; viewer: string | null; onRedact?: (id: number) => void }) {
   const [limit, setLimit] = createSignal(page)
   const entries = () => props.history?.entries ?? []
   return (
@@ -409,6 +409,12 @@ function ActivityList(props: { history: History | undefined; me: Me; viewer: str
                     <span class="faint truncate">
                       {ago(entry.at)}
                       <Show when={entry.note && entry.kind !== "grant"}> · {entry.note}</Show>
+                      <Show when={props.onRedact && entry.note && entry.note !== "redacted" && entry.kind !== "grant"}>
+                        {" · "}
+                        <button type="button" class="link bg-transparent border-0 p-0 cursor-pointer" onClick={() => props.onRedact!(entry.id)}>
+                          redact
+                        </button>
+                      </Show>
                       <Show when={entry.link}>
                         {" · "}
                         <a class="link" href={entry.link!} target="_blank" rel="noreferrer">
@@ -1096,11 +1102,16 @@ function ChannelsPanel() {
 }
 
 function AllActivityPanel(props: { me: Me }) {
-  const [history] = createResource(() => api.allHistory())
+  const [history, { refetch }] = createResource(() => api.allHistory())
+  const redact = async (id: number) => {
+    if (!confirm("Replace this note with \"redacted\"? The coins stay as they are.")) return
+    await api.redact(id)
+    refetch()
+  }
   return (
     <Panel title="Everything" description="Every transaction in the workspace, newest first.">
       <div class="border-t divider">
-        <ActivityList history={history()} me={props.me} viewer={null} />
+        <ActivityList history={history()} me={props.me} viewer={null} onRedact={redact} />
       </div>
     </Panel>
   )

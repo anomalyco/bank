@@ -619,6 +619,15 @@ export class Workspace extends DurableObject<Env> {
     return { ok: true }
   }
 
+  /** Replaces a transaction's note. The amount and the people involved stay as they were. */
+  async redact(viewer: Viewer, id: number) {
+    this.assertAdmin(viewer)
+    const changed = this.sql.exec("update entries set note = 'redacted' where id = ? and note is not null", id).rowsWritten
+    if (!changed) throw new Error("no note to redact")
+    console.log("redact", { by: viewer.id, entry: id })
+    return { ok: true }
+  }
+
   async admins(viewer: Viewer): Promise<Admin[]> {
     this.assertAdmin(viewer)
     const added = this.sql.exec<{ id: string; source: "installer" | "added" }>("select id, source from admins").toArray()

@@ -235,6 +235,7 @@ async function api(request: Request, env: Env, path: string) {
     const input = await body<{ to: string; amount: number; note?: string }>()
     return ws.adjust(user, input.to, Number(input.amount), input.note?.trim() || null)
   }
+  if (route === "POST /admin/redact") return ws.redact(user, Number((await body<{ id: number }>()).id))
   if (route === "GET /admin/admins") return ws.admins(user)
   if (route === "POST /admin/admins") return ws.addAdmin(user, (await body<{ id: string }>()).id).then(() => ({ ok: true }))
   if (route === "DELETE /admin/admins") {

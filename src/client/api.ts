@@ -38,5 +38,6 @@ export const api = {
   addAdmin: (id: string) => request("POST", "/admin/admins", { id }),
   removeAdmin: (id: string) => request("DELETE", "/admin/admins", { id }),
   emoji: () => request<CustomEmoji[]>("GET", "/admin/emoji"),
+  redact: (id: number) => request("POST", "/admin/redact", { id }),
   join: () => request<{ joined: number }>("POST", "/admin/join"),
 }
