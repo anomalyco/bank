@@ -243,6 +243,7 @@ async function api(request: Request, env: Env, path: string) {
   }
   if (route === "GET /admin/emoji") return ws.customEmoji(user)
   if (route === "POST /admin/join") return ws.joinChannels(user)
+  if (route === "POST /admin/sync") return ws.resyncMembers(user)
   throw new HttpError(404, "not found")
 }
 

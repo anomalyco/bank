@@ -370,8 +370,9 @@ export class Workspace extends DurableObject<Env> {
    */
   private applyMember(member: SlackMember, config: Config, now: number) {
     if (member.is_bot || member.is_app_user || member.id === "USLACKBOT") return
-    // user_change also fires for Slack Connect members of other companies; they never get an account.
-    if (this.outsider(member)) return
+    // Bank's member list and user_change events include Slack Connect members of other companies. They never get an
+    // account; one opened before this check is hidden and its coins go back to the bank.
+    if (this.outsider(member)) return this.removeOutsider(member.id, now)
     const name = member.profile?.display_name || member.profile?.real_name || member.real_name || member.name
     const image = member.profile?.image_72 ?? null
     const admin = member.is_admin || member.is_owner ? 1 : 0
@@ -408,6 +409,22 @@ export class Workspace extends DurableObject<Env> {
     )
   }
 
+  /** Hides an account that turned out to belong to another organization and returns its coins to the bank. */
+  private removeOutsider(id: string, now: number) {
+    const known = this.row(id)
+    if (!known || known.gone) return
+    this.sql.exec("update accounts set gone = 1, balance = 0 where id = ?", id)
+    if (known.balance > 0) {
+      this.sql.exec(
+        "insert into entries (at, kind, from_id, amount, note) values (?, 'adjust', ?, ?, 'not a member of this workspace')",
+        now,
+        id,
+        known.balance,
+      )
+    }
+    console.log("outsider removed", { user: id, balance: known.balance })
+  }
+
   /** Reads the whole member list from Slack and applies everyone. */
   private async syncMembers() {
     const members: SlackMember[] = []
@@ -425,6 +442,16 @@ export class Workspace extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       for (const member of members) this.applyMember(member, config, now)
     })
+    // Accounts opened outside the member list (a reaction from a Slack Connect channel, say) get checked one by one.
+    const listed = new Set(members.map((member) => member.id))
+    const unlisted = this.sql
+      .exec<{ id: string }>("select id from accounts where gone = 0 and bot = 0")
+      .toArray()
+      .filter((row) => !listed.has(row.id))
+    for (const { id } of unlisted) {
+      const profile = await this.profile(id)
+      if (profile?.outsider) this.ctx.storage.transactionSync(() => this.removeOutsider(id, Date.now()))
+    }
     this.setMeta("synced", now)
     return members.length
   }
@@ -684,6 +711,12 @@ export class Workspace extends DurableObject<Env> {
     return members.sort((a, b) => a.name.localeCompare(b.name))
   }
 
+  /** Re-reads the member list from Slack now instead of waiting for the daily pass. */
+  async resyncMembers(viewer: Viewer) {
+    this.assertAdmin(viewer)
+    return { members: await this.syncMembers() }
+  }
+
   async joinChannels(viewer: Viewer) {
     this.assertAdmin(viewer)
     return this.joinPublicChannels()
@@ -741,6 +774,7 @@ export class Workspace extends DurableObject<Env> {
     if (!accounts.get(from)) return { ok: false, message: `only members of ${this.install()?.teamName ?? "this workspace"} can give ${config.plural}` }
     if (!recipient) return { ok: false, message: `only members of ${this.install()?.teamName ?? "this workspace"} can get ${config.plural}` }
     if (recipient.bot) return { ok: false, message: `bots can't hold ${config.plural}` }
+    if (recipient.gone) return { ok: false, message: `that account is no longer active` }
     const result = this.move({ from, to, amount, kind, note, actor: from, link })
     if (!result.ok) {
       return {
