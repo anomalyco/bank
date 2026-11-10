@@ -1,0 +1,54 @@
+{
+  "display_information": {
+    "name": "Bank",
+    "description": "A tiny currency for your Slack. Give coins with a reaction or /bank give.",
+    "background_color": "#1a1a1a",
+    "long_description": "Everyone in your workspace starts with 100 coins. Give them away when someone helps you out: react to their message with a coin emoji, or run /bank give @someone 10. Check your balance with /bank balance and see the leaderboard with /bank top. Admins can rename the currency, change the starting balance, choose which emoji are worth what, and adjust balances at https://anoma.ly/labs/bank."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": true
+    },
+    "bot_user": {
+      "display_name": "Bank",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/bank",
+        "url": "https://anoma.ly/labs/bank/slack/commands",
+        "description": "Give coins, check your balance, see the leaderboard",
+        "usage_hint": "give @someone 10 for the fix · balance · top · history",
+        "should_escape": true
+      }
+    ]
+  },
+  "oauth_config": {
+    "redirect_urls": ["https://anoma.ly/labs/bank/auth/install", "https://anoma.ly/labs/bank/auth/login"],
+    "scopes": {
+      "user": ["openid", "profile"],
+      "bot": [
+        "commands",
+        "chat:write",
+        "im:write",
+        "reactions:read",
+        "users:read",
+        "emoji:read",
+        "team:read",
+        "channels:read",
+        "channels:join"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://anoma.ly/labs/bank/slack/events",
+      "bot_events": ["reaction_added", "reaction_removed", "app_uninstalled", "tokens_revoked"]
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

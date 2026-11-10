@@ -1,0 +1,681 @@
+import { DurableObject } from "cloudflare:workers"
+import {
+  currency,
+  defaultConfig,
+  type Account,
+  type Admin,
+  type Config,
+  type CustomEmoji,
+  type Entry,
+  type EntryKind,
+  type History,
+  type Me,
+} from "../shared/types"
+import type { Env } from "./env"
+import { slack, SlackError } from "./slack"
+
+export type Install = {
+  token: string
+  botUserId: string
+  appId: string
+  teamId: string
+  teamName: string
+  domain: string | null
+  icon: string | null
+  installer: string
+  installedAt: number
+}
+
+export type Viewer = { id: string; name: string; image: string | null }
+
+type AccountRow = {
+  id: string
+  name: string
+  image: string | null
+  bot: number
+  balance: number
+  received: number
+  given: number
+  slack_admin: number
+}
+
+type EntryRow = {
+  id: number
+  at: number
+  kind: EntryKind
+  from_id: string | null
+  to_id: string | null
+  amount: number
+  note: string | null
+  actor: string | null
+  link: string | null
+}
+
+type Profile = { id: string; name: string; image: string | null; bot: boolean; deleted: boolean; admin: boolean }
+
+type Move =
+  | { ok: true; id: number; from: number | null; to: number | null }
+  | { ok: false; reason: "insufficient" | "unknown"; balance: number }
+
+export type SlackMessage = { response_type: "ephemeral" | "in_channel"; text: string }
+
+type ReactionEvent = {
+  type: "reaction_added" | "reaction_removed"
+  user: string
+  reaction: string
+  item_user?: string
+  item: { type: string; channel?: string; ts?: string }
+}
+
+export type EventEnvelope = {
+  event_id: string
+  event: { type: string } & Partial<Omit<ReactionEvent, "type">>
+}
+
+const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
+
+export class Workspace extends DurableObject<Env> {
+  private sql: SqlStorage
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env)
+    this.sql = ctx.storage.sql
+    this.sql.exec(`
+      create table if not exists meta (key text primary key, value text not null);
+      create table if not exists accounts (
+        id text primary key,
+        name text not null,
+        image text,
+        bot integer not null default 0,
+        balance integer not null default 0,
+        received integer not null default 0,
+        given integer not null default 0,
+        slack_admin integer not null default 0,
+        created_at integer not null
+      );
+      create table if not exists entries (
+        id integer primary key autoincrement,
+        at integer not null,
+        kind text not null,
+        from_id text,
+        to_id text,
+        amount integer not null,
+        note text,
+        actor text,
+        link text
+      );
+      create index if not exists entries_from on entries (from_id, id);
+      create index if not exists entries_to on entries (to_id, id);
+      create table if not exists reactions (
+        key text primary key,
+        from_id text not null,
+        to_id text not null,
+        amount integer not null
+      );
+      create table if not exists admins (id text primary key, source text not null, added_by text, at integer not null);
+      create table if not exists events (id text primary key, at integer not null);
+    `)
+  }
+
+  // ---------- storage helpers
+
+  private meta<T>(key: string): T | null {
+    const row = this.sql.exec<{ value: string }>("select value from meta where key = ?", key).toArray()[0]
+    return row ? (JSON.parse(row.value) as T) : null
+  }
+
+  private setMeta(key: string, value: unknown) {
+    this.sql.exec("insert or replace into meta (key, value) values (?, ?)", key, JSON.stringify(value))
+  }
+
+  private install() {
+    return this.meta<Install>("install")
+  }
+
+  private config(): Config {
+    return { ...defaultConfig, ...this.meta<Partial<Config>>("config") }
+  }
+
+  private row(id: string) {
+    return this.sql.exec<AccountRow>("select * from accounts where id = ?", id).toArray()[0] ?? null
+  }
+
+  private account(row: AccountRow): Account {
+    return {
+      id: row.id,
+      name: row.name,
+      image: row.image,
+      balance: row.balance,
+      received: row.received,
+      given: row.given,
+    }
+  }
+
+  private entry(row: EntryRow): Entry {
+    return {
+      id: row.id,
+      at: row.at,
+      kind: row.kind,
+      from: row.from_id,
+      to: row.to_id,
+      amount: row.amount,
+      note: row.note,
+      actor: row.actor,
+      link: row.link,
+    }
+  }
+
+  private async call<T = Record<string, unknown>>(method: string, params: Record<string, unknown> = {}) {
+    const install = this.install()
+    if (!install) throw new SlackError(method, "not_installed")
+    return slack<T>(method, install.token, params)
+  }
+
+  private async profile(id: string): Promise<Profile | null> {
+    try {
+      const result = await this.call<{
+        user: {
+          id: string
+          name: string
+          real_name?: string
+          is_bot?: boolean
+          deleted?: boolean
+          is_admin?: boolean
+          is_owner?: boolean
+          profile?: { display_name?: string; real_name?: string; image_72?: string }
+        }
+      }>("users.info", { user: id })
+      const user = result.user
+      return {
+        id: user.id,
+        name: user.profile?.display_name || user.profile?.real_name || user.real_name || user.name,
+        image: user.profile?.image_72 ?? null,
+        bot: Boolean(user.is_bot) || user.id === "USLACKBOT",
+        deleted: Boolean(user.deleted),
+        admin: Boolean(user.is_admin || user.is_owner),
+      }
+    } catch (error) {
+      console.error("users.info failed", id, error)
+      return null
+    }
+  }
+
+  /** Opens accounts for people seen for the first time, each with the starting grant. */
+  private async ensure(ids: string[]) {
+    const missing = [...new Set(ids)].filter((id) => !this.row(id))
+    const profiles = await Promise.all(missing.map((id) => this.profile(id)))
+    const config = this.config()
+    for (const profile of profiles) {
+      if (!profile) continue
+      this.ctx.storage.transactionSync(() => {
+        const created = this.sql.exec(
+          "insert or ignore into accounts (id, name, image, bot, slack_admin, created_at) values (?, ?, ?, ?, ?, ?)",
+          profile.id,
+          profile.name,
+          profile.image,
+          profile.bot ? 1 : 0,
+          profile.admin ? 1 : 0,
+          Date.now(),
+        ).rowsWritten
+        if (!created || profile.bot || profile.deleted || config.starting <= 0) return
+        this.sql.exec("update accounts set balance = ? where id = ?", config.starting, profile.id)
+        this.sql.exec(
+          "insert into entries (at, kind, to_id, amount, note) values (?, 'grant', ?, ?, ?)",
+          Date.now(),
+          profile.id,
+          config.starting,
+          "starting balance",
+        )
+      })
+    }
+    return new Map(ids.map((id) => [id, this.row(id)]))
+  }
+
+  /** Moves coins between accounts. A null side is the bank itself, for grants and admin adjustments. */
+  private move(input: {
+    from: string | null
+    to: string | null
+    amount: number
+    kind: EntryKind
+    note?: string | null
+    actor?: string | null
+    link?: string | null
+  }): Move {
+    return this.ctx.storage.transactionSync((): Move => {
+      const from = input.from ? this.row(input.from) : null
+      const to = input.to ? this.row(input.to) : null
+      if ((input.from && !from) || (input.to && !to)) return { ok: false, reason: "unknown", balance: 0 }
+      if (from && from.balance < input.amount) return { ok: false, reason: "insufficient", balance: from.balance }
+      if (from) this.sql.exec("update accounts set balance = balance - ? where id = ?", input.amount, from.id)
+      if (to) this.sql.exec("update accounts set balance = balance + ? where id = ?", input.amount, to.id)
+      if (from && to && (input.kind === "give" || input.kind === "reaction")) {
+        this.sql.exec("update accounts set given = given + ? where id = ?", input.amount, from.id)
+        this.sql.exec("update accounts set received = received + ? where id = ?", input.amount, to.id)
+      }
+      // A refund goes from the person who got the gift back to the person who gave it, undoing both totals.
+      if (from && to && input.kind === "refund") {
+        this.sql.exec("update accounts set received = received - ? where id = ?", input.amount, from.id)
+        this.sql.exec("update accounts set given = given - ? where id = ?", input.amount, to.id)
+      }
+      const id = this.sql
+        .exec<{ id: number }>(
+          "insert into entries (at, kind, from_id, to_id, amount, note, actor, link) values (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+          Date.now(),
+          input.kind,
+          input.from,
+          input.to,
+          input.amount,
+          input.note ?? null,
+          input.actor ?? null,
+          input.link ?? null,
+        )
+        .one().id
+      return {
+        ok: true,
+        id,
+        from: input.from ? this.row(input.from)!.balance : null,
+        to: input.to ? this.row(input.to)!.balance : null,
+      }
+    })
+  }
+
+  private isAdmin(id: string) {
+    if (this.sql.exec("select 1 from admins where id = ?", id).toArray().length) return true
+    return this.row(id)?.slack_admin === 1
+  }
+
+  // ---------- install and sign in
+
+  async installed(data: Omit<Install, "installedAt">): Promise<Viewer> {
+    this.setMeta("install", { ...data, installedAt: Date.now() } satisfies Install)
+    this.sql.exec(
+      "insert or replace into admins (id, source, added_by, at) values (?, 'installer', null, ?)",
+      data.installer,
+      Date.now(),
+    )
+    const accounts = await this.ensure([data.installer])
+    const row = accounts.get(data.installer)
+    return { id: data.installer, name: row?.name ?? "someone", image: row?.image ?? null }
+  }
+
+  async uninstalled() {
+    const install = this.install()
+    if (install) this.setMeta("install", { ...install, token: "" })
+  }
+
+  async login(viewer: Viewer) {
+    if (!this.install()?.token) return
+    await this.ensure([viewer.id])
+    const profile = await this.profile(viewer.id)
+    if (profile) {
+      this.sql.exec(
+        "update accounts set name = ?, image = ?, slack_admin = ? where id = ?",
+        profile.name,
+        profile.image,
+        profile.admin ? 1 : 0,
+        viewer.id,
+      )
+    }
+  }
+
+  async me(viewer: Viewer, team: { id: string; name: string; domain: string | null; icon: string | null }): Promise<Me> {
+    const install = this.install()
+    const row = this.row(viewer.id)
+    return {
+      user: viewer,
+      team: install
+        ? { id: install.teamId, name: install.teamName, domain: install.domain, icon: install.icon }
+        : team,
+      installed: Boolean(install?.token),
+      admin: this.isAdmin(viewer.id),
+      account: row ? this.account(row) : null,
+      config: this.config(),
+    }
+  }
+
+  async leaderboard() {
+    return {
+      accounts: this.sql
+        .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc, name asc limit 500")
+        .toArray()
+        .map((row) => this.account(row)),
+    }
+  }
+
+  async history(viewer: Viewer, scope: "mine" | "all", limit = 200): Promise<History> {
+    if (scope === "all" && !this.isAdmin(viewer.id)) throw new Error("forbidden")
+    const rows =
+      scope === "all"
+        ? this.sql.exec<EntryRow>("select * from entries order by id desc limit ?", limit).toArray()
+        : this.sql
+            .exec<EntryRow>(
+              "select * from entries where from_id = ?1 or to_id = ?1 order by id desc limit ?2",
+              viewer.id,
+              limit,
+            )
+            .toArray()
+    const ids = new Set<string>()
+    for (const row of rows) {
+      if (row.from_id) ids.add(row.from_id)
+      if (row.to_id) ids.add(row.to_id)
+      if (row.actor) ids.add(row.actor)
+    }
+    const people: History["people"] = {}
+    for (const id of ids) {
+      const row = this.row(id)
+      people[id] = { name: row?.name ?? id, image: row?.image ?? null }
+    }
+    return { entries: rows.map((row) => this.entry(row)), people }
+  }
+
+  async give(viewer: Viewer, to: string, amount: number, note: string | null) {
+    const result = await this.transfer(viewer.id, to, amount, note, "give")
+    if (!result.ok) throw new Error(result.message)
+    return { balance: result.balance }
+  }
+
+  // ---------- admin
+
+  private assertAdmin(viewer: Viewer) {
+    if (!this.isAdmin(viewer.id)) throw new Error("forbidden")
+  }
+
+  async saveConfig(viewer: Viewer, input: Config): Promise<Config> {
+    this.assertAdmin(viewer)
+    const clean = (text: string, max: number) => String(text ?? "").trim().slice(0, max)
+    const names = new Set<string>()
+    const emoji = (input.emoji ?? [])
+      .map((item) => ({ name: clean(item.name, 100).replace(/^:|:$/g, "").toLowerCase(), amount: Math.floor(Number(item.amount)) }))
+      .filter((item) => /^[a-z0-9_\-+'.]+$/.test(item.name) && item.amount > 0 && item.amount <= 1_000_000)
+      .filter((item) => !names.has(item.name) && names.add(item.name))
+      .slice(0, 24)
+    const config: Config = {
+      singular: clean(input.singular, 32) || defaultConfig.singular,
+      plural: clean(input.plural, 32) || defaultConfig.plural,
+      symbol: clean(input.symbol, 8),
+      starting: Math.max(0, Math.min(1_000_000, Math.floor(Number(input.starting) || 0))),
+      emoji,
+      notify: Boolean(input.notify),
+    }
+    this.setMeta("config", config)
+    return config
+  }
+
+  async adjust(viewer: Viewer, target: string, amount: number, note: string | null) {
+    this.assertAdmin(viewer)
+    amount = Math.trunc(amount)
+    if (!amount) throw new Error("amount must not be zero")
+    const accounts = await this.ensure([target])
+    if (!accounts.get(target)) throw new Error("unknown person")
+    const result =
+      amount > 0
+        ? this.move({ from: null, to: target, amount, kind: "adjust", note, actor: viewer.id })
+        : this.move({ from: target, to: null, amount: -amount, kind: "adjust", note, actor: viewer.id })
+    if (!result.ok) throw new Error(result.reason === "insufficient" ? `they only have ${result.balance}` : "unknown person")
+    return { ok: true }
+  }
+
+  async admins(viewer: Viewer): Promise<Admin[]> {
+    this.assertAdmin(viewer)
+    const added = this.sql.exec<{ id: string; source: "installer" | "added" }>("select id, source from admins").toArray()
+    const slackAdmins = this.sql.exec<{ id: string }>("select id from accounts where slack_admin = 1").toArray()
+    const result = new Map<string, Admin>()
+    for (const { id } of slackAdmins) result.set(id, { id, name: id, image: null, source: "slack" })
+    for (const { id, source } of added) result.set(id, { id, name: id, image: null, source })
+    for (const admin of result.values()) {
+      const row = this.row(admin.id)
+      if (row) {
+        admin.name = row.name
+        admin.image = row.image
+      }
+    }
+    return [...result.values()]
+  }
+
+  async addAdmin(viewer: Viewer, id: string) {
+    this.assertAdmin(viewer)
+    await this.ensure([id])
+    this.sql.exec("insert or ignore into admins (id, source, added_by, at) values (?, 'added', ?, ?)", id, viewer.id, Date.now())
+  }
+
+  async removeAdmin(viewer: Viewer, id: string) {
+    this.assertAdmin(viewer)
+    this.sql.exec("delete from admins where id = ? and source = 'added'", id)
+  }
+
+  async customEmoji(viewer: Viewer): Promise<CustomEmoji[]> {
+    this.assertAdmin(viewer)
+    const result = await this.call<{ emoji: Record<string, string> }>("emoji.list")
+    return Object.entries(result.emoji)
+      .filter(([, url]) => !url.startsWith("alias:"))
+      .map(([name, url]) => ({ name, url }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  async people(viewer: Viewer) {
+    const members: Viewer[] = []
+    let cursor: string | undefined
+    do {
+      const page = await this.call<{
+        members: { id: string; name: string; deleted?: boolean; is_bot?: boolean; profile?: { display_name?: string; real_name?: string; image_72?: string } }[]
+        response_metadata?: { next_cursor?: string }
+      }>("users.list", { limit: 200, cursor })
+      for (const member of page.members) {
+        if (member.deleted || member.is_bot || member.id === "USLACKBOT") continue
+        members.push({
+          id: member.id,
+          name: member.profile?.display_name || member.profile?.real_name || member.name,
+          image: member.profile?.image_72 ?? null,
+        })
+      }
+      cursor = page.response_metadata?.next_cursor || undefined
+    } while (cursor)
+    void viewer
+    return members.sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  async joinChannels(viewer: Viewer) {
+    this.assertAdmin(viewer)
+    let joined = 0
+    let cursor: string | undefined
+    do {
+      const page = await this.call<{
+        channels: { id: string; is_member: boolean; is_archived: boolean }[]
+        response_metadata?: { next_cursor?: string }
+      }>("conversations.list", { types: "public_channel", exclude_archived: true, limit: 200, cursor })
+      for (const channel of page.channels) {
+        if (channel.is_member || channel.is_archived) continue
+        try {
+          await this.call("conversations.join", { channel: channel.id })
+          joined++
+        } catch (error) {
+          console.error("join failed", channel.id, error)
+        }
+      }
+      cursor = page.response_metadata?.next_cursor || undefined
+    } while (cursor)
+    return { joined }
+  }
+
+  // ---------- Slack: slash command
+
+  private async transfer(
+    from: string,
+    to: string,
+    amount: number,
+    note: string | null,
+    kind: "give" | "reaction",
+    link: string | null = null,
+  ): Promise<{ ok: true; balance: number } | { ok: false; message: string }> {
+    const config = this.config()
+    if (!Number.isInteger(amount) || amount <= 0) return { ok: false, message: "the amount has to be a whole number above 0" }
+    if (from === to) return { ok: false, message: `you can't give ${config.plural} to yourself` }
+    const accounts = await this.ensure([from, to])
+    const recipient = accounts.get(to)
+    if (!accounts.get(from)) return { ok: false, message: "couldn't look you up in slack, try again" }
+    if (!recipient) return { ok: false, message: "couldn't find that person" }
+    if (recipient.bot) return { ok: false, message: `bots can't hold ${config.plural}` }
+    const result = this.move({ from, to, amount, kind, note, actor: from, link })
+    if (!result.ok) {
+      return {
+        ok: false,
+        message:
+          result.reason === "insufficient"
+            ? `you only have ${currency(config, result.balance)}`
+            : "something went wrong, try again",
+      }
+    }
+    return { ok: true, balance: result.from ?? 0 }
+  }
+
+  async command(params: { text: string; user_id: string }): Promise<SlackMessage> {
+    const config = this.config()
+    const text = params.text.trim()
+    const words = text.split(/\s+/).filter(Boolean)
+    const sub = (words[0] ?? "").toLowerCase()
+    const reply = (text: string): SlackMessage => ({ response_type: "ephemeral", text })
+
+    if (sub === "" || sub === "help") return reply(this.help(config))
+
+    if (sub === "balance" || sub === "bal") {
+      const row = (await this.ensure([params.user_id])).get(params.user_id)
+      return reply(`you have *${currency(config, row?.balance ?? 0)}* ${config.symbol}`.trim())
+    }
+
+    if (sub === "top" || sub === "leaderboard") {
+      const rows = this.sql
+        .exec<AccountRow>("select * from accounts where bot = 0 order by balance desc, received desc limit 10")
+        .toArray()
+      if (!rows.length) return reply("nobody has any yet")
+      const lines = rows.map((row, i) => `${i + 1}. <@${row.id}> · ${currency(config, row.balance)}`)
+      return reply(`*leaderboard*\n${lines.join("\n")}\n\n<${this.env.PUBLIC_URL}|see everything>`)
+    }
+
+    if (sub === "history") {
+      const rows = this.sql
+        .exec<EntryRow>("select * from entries where from_id = ?1 or to_id = ?1 order by id desc limit 10", params.user_id)
+        .toArray()
+      if (!rows.length) return reply("nothing yet")
+      const lines = rows.map((row) => {
+        const amount = currency(config, row.amount)
+        const note = row.note ? ` · ${row.note}` : ""
+        if (row.kind === "grant") return `+${amount} starting balance`
+        if (row.kind === "adjust") return row.to_id === params.user_id ? `+${amount} from an admin${note}` : `-${amount} by an admin${note}`
+        if (row.kind === "refund") return row.to_id === params.user_id ? `+${amount} refunded by <@${row.from_id}>` : `-${amount} refunded to <@${row.to_id}>`
+        return row.from_id === params.user_id ? `-${amount} to <@${row.to_id}>${note}` : `+${amount} from <@${row.from_id}>${note}`
+      })
+      return reply(`*your recent activity*\n${lines.join("\n")}`)
+    }
+
+    if (sub === "admin" || sub === "settings") return reply(`<${this.env.PUBLIC_URL}|open bank>`)
+
+    // give / send / pay, or just "/bank @someone 10"
+    const rest = ["give", "send", "pay", "tip"].includes(sub) ? words.slice(1) : words
+    const mention = rest.find((word) => MENTION.test(word))
+    const amountWord = rest.find((word) => /^\d+$/.test(word))
+    if (!mention || !amountWord) return reply(`didn't get that.\n\n${this.help(config)}`)
+    const to = mention.match(MENTION)![1]!
+    const amount = Number(amountWord)
+    const note =
+      rest
+        .filter((word) => word !== mention && word !== amountWord)
+        .join(" ")
+        .replace(/^for\s+/i, "")
+        .trim()
+        .slice(0, 280) || null
+    const result = await this.transfer(params.user_id, to, amount, note, "give")
+    if (!result.ok) return reply(result.message)
+    return {
+      response_type: "in_channel",
+      text: `${config.symbol} <@${params.user_id}> gave <@${to}> *${currency(config, amount)}*${note ? ` · ${note}` : ""}`.trim(),
+    }
+  }
+
+  private help(config: Config) {
+    const emoji = config.emoji.map((item) => `:${item.name}: ${item.amount}`).join("  ")
+    return [
+      `*bank* · everyone starts with ${currency(config, config.starting)}`,
+      `\`/bank give @someone 10 for fixing the deploy\``,
+      `\`/bank balance\` · how many you have`,
+      `\`/bank top\` · leaderboard`,
+      `\`/bank history\` · your recent activity`,
+      emoji ? `or react to a message to give: ${emoji}` : "",
+      `<${this.env.PUBLIC_URL}|open bank>`,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  }
+
+  // ---------- Slack: events
+
+  async event(envelope: EventEnvelope) {
+    const fresh = this.sql
+      .exec("insert or ignore into events (id, at) values (?, ?)", envelope.event_id, Date.now()).rowsWritten
+    if (!fresh) return
+    this.sql.exec("delete from events where at < ?", Date.now() - 24 * 60 * 60 * 1000)
+    const event = envelope.event
+    if (event.type === "app_uninstalled" || event.type === "tokens_revoked") return this.uninstalled()
+    if (!this.install()?.token) return
+    if (event.type === "reaction_added" || event.type === "reaction_removed") {
+      return this.reaction(event as ReactionEvent)
+    }
+  }
+
+  private async reaction(event: ReactionEvent) {
+    const config = this.config()
+    const name = event.reaction.split("::")[0]!
+    const value = config.emoji.find((item) => item.name === name)
+    const channel = event.item.channel
+    const ts = event.item.ts
+    const to = event.item_user
+    if (!value || event.item.type !== "message" || !channel || !ts || !to || to === event.user) return
+    const key = `${channel}:${ts}:${event.user}:${name}`
+
+    if (event.type === "reaction_removed") {
+      const gift = this.sql
+        .exec<{ from_id: string; to_id: string; amount: number }>("select * from reactions where key = ?", key)
+        .toArray()[0]
+      if (!gift) return
+      this.sql.exec("delete from reactions where key = ?", key)
+      const result = this.move({
+        from: gift.to_id,
+        to: gift.from_id,
+        amount: gift.amount,
+        kind: "refund",
+        note: `removed :${name}:`,
+        actor: gift.from_id,
+      })
+      if (!result.ok) console.log("refund skipped", key, result.reason)
+      return
+    }
+
+    if (this.sql.exec("select 1 from reactions where key = ?", key).toArray().length) return
+    const link = await this.call<{ permalink: string }>("chat.getPermalink", { channel, message_ts: ts })
+      .then((result) => result.permalink)
+      .catch(() => null)
+    const result = await this.transfer(event.user, to, value.amount, null, "reaction", link)
+    if (!result.ok) {
+      await this.call("chat.postEphemeral", {
+        channel,
+        user: event.user,
+        text: `your :${name}: didn't go through: ${result.message}`,
+      }).catch((error) => console.error("ephemeral failed", error))
+      return
+    }
+    this.sql.exec(
+      "insert or replace into reactions (key, from_id, to_id, amount) values (?, ?, ?, ?)",
+      key,
+      event.user,
+      to,
+      value.amount,
+    )
+    if (config.notify) {
+      const where = link ? ` for <${link}|your message>` : ""
+      await this.call("chat.postMessage", {
+        channel: to,
+        text: `${config.symbol} <@${event.user}> gave you *${currency(config, value.amount)}*${where}`.trim(),
+        unfurl_links: false,
+      }).catch((error) => console.error("notify failed", error))
+    }
+  }
+}
