@@ -227,6 +227,14 @@ async function api(request: Request, env: Env, path: string) {
     const ids = (new URL(request.url).searchParams.get("ids") ?? "").split(",").filter((id) => /^[0-9a-f]{64}$/.test(id))
     return Promise.all(ids.map(async (id) => ({ id, ...(await env.WORKSPACES.get(env.WORKSPACES.idFromString(id)).summary()) })))
   }
+  if (route === "POST /operator/reconcile") {
+    if (viewer.id !== "U065BMCVB8F" || viewer.team.id !== "T0HJ2SVJ4") throw new HttpError(404, "not found")
+    const input = await body<{ ids: string[]; apply?: boolean }>()
+    const ids = (input.ids ?? []).filter((id) => /^[0-9a-f]{64}$/.test(id))
+    return Promise.all(
+      ids.map(async (id) => ({ id, ...(await env.WORKSPACES.get(env.WORKSPACES.idFromString(id)).reconcile(Boolean(input.apply))) })),
+    )
+  }
   if (route === "GET /me") return ws.me(user, viewer.team)
   if (route === "GET /leaderboard") return ws.leaderboard()
   if (route === "GET /history") return ws.history(user, "mine")

@@ -509,6 +509,55 @@ export class Workspace extends DurableObject<Env> {
     return { id: data.installer, name: row?.name ?? "someone", image: row?.image ?? null }
   }
 
+  /**
+   * Rebuilds every stored balance, and the received and given totals, from the ledger entries, which are the source of
+   * truth, and reports the accounts that don't match. With `apply`, sets the stored numbers back to what the ledger says.
+   * No entries are added: the ledger was right, only the stored balances drifted.
+   */
+  async reconcile(apply: boolean) {
+    const rows = this.sql
+      .exec<{ id: string; name: string; balance: number; received: number; given: number; expected: number; expected_received: number; expected_given: number }>(
+        `select a.id, a.name, a.balance, a.received, a.given,
+          coalesce((select sum(amount) from entries where to_id = a.id), 0)
+            - coalesce((select sum(amount) from entries where from_id = a.id), 0) as expected,
+          coalesce((select sum(amount) from entries where to_id = a.id and from_id is not null and kind in ('give', 'reaction')), 0)
+            - coalesce((select sum(amount) from entries where from_id = a.id and to_id is not null and kind = 'refund'), 0) as expected_received,
+          coalesce((select sum(amount) from entries where from_id = a.id and to_id is not null and kind in ('give', 'reaction')), 0)
+            - coalesce((select sum(amount) from entries where to_id = a.id and from_id is not null and kind = 'refund'), 0) as expected_given
+        from accounts a`,
+      )
+      .toArray()
+    const drift = rows.filter(
+      (row) => row.balance !== row.expected || row.received !== row.expected_received || row.given !== row.expected_given,
+    )
+    if (apply && drift.length) {
+      this.ctx.storage.transactionSync(() => {
+        for (const row of drift) {
+          this.sql.exec(
+            "update accounts set balance = ?, received = ?, given = ? where id = ?",
+            row.expected,
+            row.expected_received,
+            row.expected_given,
+            row.id,
+          )
+        }
+      })
+      console.log("reconciled", { team: this.install()?.teamId, accounts: drift.map((row) => [row.id, row.balance, row.expected]) })
+    }
+    return {
+      team: this.install()?.teamName ?? null,
+      applied: apply,
+      drift: drift.map((row) => ({
+        id: row.id,
+        name: row.name,
+        balance: row.balance,
+        expected: row.expected,
+        received: [row.received, row.expected_received],
+        given: [row.given, row.expected_given],
+      })),
+    }
+  }
+
   /** What the operator sees about a workspace: no balances or notes, just who installed it and how big it is. */
   async summary() {
     const install = this.install()
