@@ -1,4 +1,4 @@
-import type { Config } from "../shared/types"
+import type { Config, ScheduleInput } from "../shared/types"
 import type { Env } from "./env"
 import { botScopes, decodeJwt, sign, slack, unsign, verified } from "./slack"
 import type { EventEnvelope, Viewer } from "./workspace"
@@ -236,7 +236,12 @@ async function api(request: Request, env: Env, path: string) {
     )
   }
   if (route === "GET /me") return ws.me(user, viewer.team)
-  if (route === "GET /leaderboard") return ws.leaderboard()
+  if (route === "GET /leaderboard") {
+    const params = new URL(request.url).searchParams
+    const from = Number(params.get("from"))
+    const to = Number(params.get("to"))
+    return ws.leaderboard(params.has("from") && params.has("to") && from >= 0 && to > from ? { from, to } : null)
+  }
   if (route === "GET /history") return ws.history(user, "mine")
   if (route === "GET /people") return ws.people(user)
   if (route === "POST /give") {
@@ -256,6 +261,10 @@ async function api(request: Request, env: Env, path: string) {
     return ws.removeAdmin(user, (await body<{ id: string }>()).id).then(() => ({ ok: true }))
   }
   if (route === "GET /admin/emoji") return ws.customEmoji(user)
+  if (route === "GET /admin/schedules") return ws.schedules(user)
+  if (route === "POST /admin/schedules") return ws.addSchedule(user, await body<ScheduleInput>())
+  if (route === "DELETE /admin/schedules") return ws.removeSchedule(user, Number((await body<{ id: number }>()).id))
+  if (route === "POST /admin/reset") return ws.resetBalances(user)
   if (route === "POST /admin/join") return ws.joinChannels(user)
   if (route === "POST /admin/sync") return ws.resyncMembers(user)
   throw new HttpError(404, "not found")
