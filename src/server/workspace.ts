@@ -10,9 +10,13 @@ import {
   type Entry,
   type EntryKind,
   type History,
+  type Leaderboard,
   type Me,
+  type Schedule,
+  type ScheduleInput,
 } from "../shared/types"
 import type { Env } from "./env"
+import { nextRun, validTimezone } from "./schedule"
 import { slack, SlackError } from "./slack"
 
 export type Install = {
@@ -51,6 +55,18 @@ type EntryRow = {
   note: string | null
   actor: string | null
   link: string | null
+}
+
+type ScheduleRow = {
+  id: number
+  amount: number
+  cadence: "weekly" | "monthly"
+  day: number
+  people: string | null
+  note: string | null
+  timezone: string
+  next_at: number
+  last_at: number | null
 }
 
 type SlackMember = {
@@ -173,6 +189,20 @@ export class Workspace extends DurableObject<Env> {
       );
       create table if not exists admins (id text primary key, source text not null, added_by text, at integer not null);
       create table if not exists events (id text primary key, at integer not null);
+      create index if not exists entries_at on entries (at);
+      create table if not exists schedules (
+        id integer primary key autoincrement,
+        amount integer not null,
+        cadence text not null,
+        day integer not null,
+        people text,
+        note text,
+        timezone text not null,
+        next_at integer not null,
+        last_at integer,
+        created_by text not null,
+        created_at integer not null
+      );
     `)
     const columns = this.sql.exec<{ name: string }>("pragma table_info(accounts)").toArray()
     if (!columns.some((column) => column.name === "gone")) {
@@ -638,14 +668,42 @@ export class Workspace extends DurableObject<Env> {
     }
   }
 
-  async leaderboard() {
+  /** All time ranks by balance. A period ranks by what people received in it, gifts only, net of refunds. */
+  async leaderboard(period: { from: number; to: number } | null = null): Promise<Leaderboard> {
     await this.freshen()
-    return {
-      accounts: this.sql
-        .exec<AccountRow>("select * from accounts where bot = 0 and gone = 0 order by balance desc, received desc, name asc limit 500")
-        .toArray()
-        .map((row) => this.account(row)),
+    if (!period) {
+      return {
+        period: null,
+        accounts: this.sql
+          .exec<AccountRow>("select * from accounts where bot = 0 and gone = 0 order by balance desc, received desc, name asc limit 500")
+          .toArray()
+          .map((row) => this.account(row)),
+      }
     }
+    const rows = this.sql
+      .exec<AccountRow>(
+        `with gifts as (
+          select from_id, to_id, kind, amount from entries
+          where at >= ?1 and at < ?2 and from_id is not null and to_id is not null and kind in ('give', 'reaction', 'refund')
+        ),
+        totals as (
+          select to_id as id, amount as received, 0 as given from gifts where kind != 'refund'
+          union all select from_id, 0, amount from gifts where kind != 'refund'
+          union all select from_id, -amount, 0 from gifts where kind = 'refund'
+          union all select to_id, 0, -amount from gifts where kind = 'refund'
+        )
+        select a.id, a.name, a.image, a.balance, sum(t.received) as received, sum(t.given) as given
+        from totals t join accounts a on a.id = t.id
+        where a.bot = 0 and a.gone = 0
+        group by a.id
+        having sum(t.received) > 0 or sum(t.given) > 0
+        order by received desc, given desc, a.name asc
+        limit 500`,
+        period.from,
+        period.to,
+      )
+      .toArray()
+    return { period, accounts: rows.map((row) => this.account(row)) }
   }
 
   async history(viewer: Viewer, scope: "mine" | "all", limit = 200): Promise<History> {
@@ -731,6 +789,147 @@ export class Workspace extends DurableObject<Env> {
         : this.move({ from: target, to: null, amount: -amount, kind: "adjust", note, actor: viewer.id })
     if (!result.ok) throw new Error(result.reason === "insufficient" ? `they only have ${result.balance}` : "unknown person")
     return { ok: true }
+  }
+
+  /** Takes every balance to 0, recording each as an adjustment. Received and given totals are lifetime and stay. */
+  async resetBalances(viewer: Viewer) {
+    this.assertAdmin(viewer)
+    const now = Date.now()
+    const result = this.ctx.storage.transactionSync(() => {
+      const rows = this.sql.exec<{ id: string; balance: number }>("select id, balance from accounts where balance != 0").toArray()
+      for (const row of rows) {
+        this.sql.exec(
+          "insert into entries (at, kind, from_id, to_id, amount, note, actor) values (?, 'adjust', ?, ?, ?, 'balance reset', ?)",
+          now,
+          row.balance > 0 ? row.id : null,
+          row.balance > 0 ? null : row.id,
+          Math.abs(row.balance),
+          viewer.id,
+        )
+      }
+      this.sql.exec("update accounts set balance = 0 where balance != 0")
+      return { accounts: rows.length, amount: rows.reduce((sum, row) => sum + row.balance, 0) }
+    })
+    console.log("reset", { by: viewer.id, ...result })
+    return result
+  }
+
+  // ---------- scheduled grants
+
+  private schedule(row: ScheduleRow): Schedule {
+    const ids = row.people ? (JSON.parse(row.people) as string[]) : null
+    return {
+      id: row.id,
+      amount: row.amount,
+      cadence: row.cadence,
+      day: row.day,
+      note: row.note,
+      timezone: row.timezone,
+      next: row.next_at,
+      last: row.last_at,
+      people:
+        ids?.map((id) => {
+          const account = this.row(id)
+          return { id, name: account?.name ?? id, image: account?.image ?? null }
+        }) ?? null,
+    }
+  }
+
+  async schedules(viewer: Viewer): Promise<Schedule[]> {
+    this.assertAdmin(viewer)
+    return this.sql
+      .exec<ScheduleRow>("select * from schedules order by next_at asc")
+      .toArray()
+      .map((row) => this.schedule(row))
+  }
+
+  async addSchedule(viewer: Viewer, input: ScheduleInput): Promise<Schedule> {
+    this.assertAdmin(viewer)
+    const amount = Math.trunc(Number(input.amount))
+    if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1_000_000) throw new Error("amount must be between 1 and 1,000,000")
+    const cadence = input.cadence === "weekly" ? "weekly" : input.cadence === "monthly" ? "monthly" : null
+    if (!cadence) throw new Error("pick weekly or monthly")
+    const day = Math.trunc(Number(input.day))
+    if (cadence === "weekly" ? !(day >= 0 && day <= 6) : !(day >= 1 && day <= 28)) throw new Error("pick a day")
+    const timezone = validTimezone(String(input.timezone)) ? String(input.timezone) : "UTC"
+    const note = String(input.note ?? "").trim().slice(0, 280) || null
+    let people: string[] | null = null
+    if (input.people) {
+      people = [...new Set(input.people.map(String))].slice(0, 500)
+      if (!people.length) throw new Error("pick at least one person")
+      const accounts = await this.ensure(people)
+      people = people.filter((id) => {
+        const row = accounts.get(id)
+        return row && !row.bot && !row.gone
+      })
+      if (!people.length) throw new Error("none of those people can hold coins")
+    }
+    if (this.sql.exec<{ n: number }>("select count(*) as n from schedules").one().n >= 20) throw new Error("at most 20 schedules")
+    const row = this.sql
+      .exec<ScheduleRow>(
+        `insert into schedules (amount, cadence, day, people, note, timezone, next_at, created_by, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning *`,
+        amount,
+        cadence,
+        day,
+        people ? JSON.stringify(people) : null,
+        note,
+        timezone,
+        nextRun(cadence, day, timezone, Date.now()),
+        viewer.id,
+        Date.now(),
+      )
+      .one()
+    console.log("schedule added", { by: viewer.id, id: row.id, amount, cadence, day, people: people?.length ?? "everyone" })
+    await this.arm()
+    return this.schedule(row)
+  }
+
+  async removeSchedule(viewer: Viewer, id: number) {
+    this.assertAdmin(viewer)
+    this.sql.exec("delete from schedules where id = ?", id)
+    console.log("schedule removed", { by: viewer.id, id })
+    await this.arm()
+    return { ok: true }
+  }
+
+  /** Points the Durable Object's single alarm at the earliest scheduled grant. */
+  private async arm() {
+    const next = this.sql.exec<{ at: number | null }>("select min(next_at) as at from schedules").one().at
+    if (next === null) await this.ctx.storage.deleteAlarm()
+    else await this.ctx.storage.setAlarm(next)
+  }
+
+  /**
+   * Pays every schedule that's due, once each, and moves it to its next run. A run missed while the alarm was late is
+   * paid once, not once per missed period. Nothing is paid while the app is uninstalled.
+   */
+  async alarm() {
+    const now = Date.now()
+    const active = Boolean(this.install()?.token)
+    for (const row of this.sql.exec<ScheduleRow>("select * from schedules where next_at <= ?", now).toArray()) {
+      this.ctx.storage.transactionSync(() => {
+        const next = nextRun(row.cadence, row.day, row.timezone, now)
+        if (!active) {
+          this.sql.exec("update schedules set next_at = ? where id = ?", next, row.id)
+          return
+        }
+        const note = row.note ?? `${row.cadence} allowance`
+        const targets = "bot = 0 and gone = 0 and (?1 is null or id in (select value from json_each(?1)))"
+        const paid = this.sql.exec<{ n: number }>(`select count(*) as n from accounts where ${targets}`, row.people).one().n
+        this.sql.exec(
+          `insert into entries (at, kind, to_id, amount, note) select ?2, 'allowance', id, ?3, ?4 from accounts where ${targets}`,
+          row.people,
+          now,
+          row.amount,
+          note,
+        )
+        this.sql.exec(`update accounts set balance = balance + ?2 where ${targets}`, row.people, row.amount)
+        this.sql.exec("update schedules set next_at = ?, last_at = ? where id = ?", next, now, row.id)
+        console.log("schedule paid", { team: this.install()?.teamId, id: row.id, amount: row.amount, accounts: paid })
+      })
+    }
+    await this.arm()
   }
 
   /** Replaces a transaction's note. The amount and the people involved stay as they were. */
@@ -912,6 +1111,7 @@ export class Workspace extends DurableObject<Env> {
         const amount = currency(config, row.amount)
         const note = row.note ? ` · ${escape(row.note)}` : ""
         if (row.kind === "grant") return `+${amount} starting balance`
+        if (row.kind === "allowance") return `+${amount}${note}`
         if (row.kind === "adjust") return row.to_id === params.user_id ? `+${amount} from an admin${note}` : `-${amount} by an admin${note}`
         if (row.kind === "refund") return row.to_id === params.user_id ? `+${amount} refunded by <@${row.from_id}>` : `-${amount} refunded to <@${row.to_id}>`
         return row.from_id === params.user_id ? `-${amount} to <@${row.to_id}>${note}` : `+${amount} from <@${row.from_id}>${note}`

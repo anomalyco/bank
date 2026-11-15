@@ -1,4 +1,4 @@
-import type { Admin, Config, CustomEmoji, History, Leaderboard, Me } from "../shared/types"
+import type { Admin, Config, CustomEmoji, History, Leaderboard, Me, Schedule, ScheduleInput } from "../shared/types"
 
 export const BASE = "/labs/bank"
 
@@ -27,7 +27,8 @@ export type Person = { id: string; name: string; image: string | null }
 
 export const api = {
   me: () => request<Me>("GET", "/me"),
-  leaderboard: () => request<Leaderboard>("GET", "/leaderboard"),
+  leaderboard: (period: { from: number; to: number } | null) =>
+    request<Leaderboard>("GET", period ? `/leaderboard?from=${period.from}&to=${period.to}` : "/leaderboard"),
   history: () => request<History>("GET", "/history"),
   people: () => request<Person[]>("GET", "/people"),
   give: (to: string, amount: number, note: string) => request<{ balance: number }>("POST", "/give", { to, amount, note }),
@@ -40,4 +41,8 @@ export const api = {
   emoji: () => request<CustomEmoji[]>("GET", "/admin/emoji"),
   redact: (id: number) => request("POST", "/admin/redact", { id }),
   join: () => request<{ joined: number }>("POST", "/admin/join"),
+  schedules: () => request<Schedule[]>("GET", "/admin/schedules"),
+  addSchedule: (input: ScheduleInput) => request<Schedule>("POST", "/admin/schedules", input),
+  removeSchedule: (id: number) => request("DELETE", "/admin/schedules", { id }),
+  reset: () => request<{ accounts: number; amount: number }>("POST", "/admin/reset"),
 }

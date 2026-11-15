@@ -4,12 +4,25 @@ import { Button } from "@opencode/ui/button"
 import { Field } from "@opencode/ui/field"
 import { Icon } from "@opencode/ui/icon"
 import { IconButton } from "@opencode/ui/icon-button"
+import { SegmentedControl, SegmentedControlItem } from "@opencode/ui/segmented-control"
+import { Select } from "@opencode/ui/select"
 import { Switch as Toggle } from "@opencode/ui/switch"
 import { Tabs } from "@opencode/ui/tabs"
 import { TextInput } from "@opencode/ui/text-input"
 import { createMemo, createResource, createRoot, createSignal, For, type JSX, Match, Show, Switch } from "solid-js"
 import { createStore, reconcile, unwrap } from "solid-js/store"
-import { currency, type Config, type CustomEmoji, type Entry, type History, type Me } from "../shared/types"
+import {
+  currency,
+  type Account,
+  type Cadence,
+  type Config,
+  type CustomEmoji,
+  type Entry,
+  type History,
+  type Leaderboard,
+  type Me,
+  type Schedule,
+} from "../shared/types"
 import { api, ApiError, BASE, type Person } from "./api"
 
 export function App() {
@@ -215,7 +228,13 @@ function NotInstalled(props: { me: Me }) {
 function Dashboard(props: { me: Me; refresh: () => void }) {
   const config = () => props.me.config
   const [tab, setTab] = createSignal("leaderboard")
-  const [leaderboard, leaderboardActions] = createResource(() => api.leaderboard())
+  const [period, setPeriod] = createSignal<Period>("all")
+  const [custom, setCustom] = createSignal({ from: dateInput(startOfMonth()), to: dateInput(new Date()) })
+  const range = createMemo(() => periodRange(period(), custom()))
+  const [leaderboard, leaderboardActions] = createResource(
+    () => range() !== undefined && { range: range()! },
+    (source) => api.leaderboard(source.range),
+  )
   const [history, historyActions] = createResource(() => api.history())
   const reload = () => {
     props.refresh()
@@ -269,7 +288,15 @@ function Dashboard(props: { me: Me; refresh: () => void }) {
 
         <Switch>
           <Match when={tab() === "leaderboard"}>
-            <LeaderboardView me={props.me} accounts={leaderboard()?.accounts} />
+            <LeaderboardView
+              me={props.me}
+              leaderboard={leaderboard.latest}
+              loading={leaderboard.loading}
+              period={period()}
+              setPeriod={setPeriod}
+              custom={custom()}
+              setCustom={setCustom}
+            />
           </Match>
           <Match when={tab() === "activity"}>
             <ActivityView me={props.me} history={history()} />
@@ -327,33 +354,134 @@ function Empty(props: { children: JSX.Element }) {
   return <div class="px-4 py-8 text-center faint">{props.children}</div>
 }
 
-function LeaderboardView(props: { me: Me; accounts: Me["account"][] | undefined }) {
+type Period = "all" | "week" | "month" | "last-month" | "year" | "custom"
+
+const periods: { value: Period; label: string }[] = [
+  { value: "all", label: "All time" },
+  { value: "week", label: "This week" },
+  { value: "month", label: "This month" },
+  { value: "last-month", label: "Last month" },
+  { value: "year", label: "This year" },
+  { value: "custom", label: "Custom range" },
+]
+
+function startOfMonth() {
+  const now = new Date()
+  return new Date(now.getFullYear(), now.getMonth(), 1)
+}
+
+/** A local date as the value of an `<input type="date">`. */
+function dateInput(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`
+}
+
+/** The period as local-time bounds, end exclusive. Null is all time; undefined is a custom range that isn't valid yet. */
+function periodRange(period: Period, custom: { from: string; to: string }) {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = now.getMonth()
+  const day = (y: number, m: number, d: number) => new Date(y, m, d).getTime()
+  switch (period) {
+    case "all":
+      return null
+    case "week": {
+      const monday = now.getDate() - ((now.getDay() + 6) % 7)
+      return { from: day(year, month, monday), to: day(year, month, monday + 7) }
+    }
+    case "month":
+      return { from: day(year, month, 1), to: day(year, month + 1, 1) }
+    case "last-month":
+      return { from: day(year, month - 1, 1), to: day(year, month, 1) }
+    case "year":
+      return { from: day(year, 0, 1), to: day(year + 1, 0, 1) }
+    case "custom": {
+      const [fy, fm, fd] = custom.from.split("-").map(Number)
+      const [ty, tm, td] = custom.to.split("-").map(Number)
+      if (!fy || !fm || !fd || !ty || !tm || !td) return undefined
+      const range = { from: day(fy, fm - 1, fd), to: day(ty, tm - 1, td + 1) }
+      return range.to > range.from ? range : undefined
+    }
+  }
+}
+
+function LeaderboardView(props: {
+  me: Me
+  leaderboard: Leaderboard | undefined
+  loading: boolean
+  period: Period
+  setPeriod: (period: Period) => void
+  custom: { from: string; to: string }
+  setCustom: (custom: { from: string; to: string }) => void
+}) {
+  const ranked = () => (props.leaderboard ? props.leaderboard.period !== null : props.period !== "all")
+  const accounts = () => props.leaderboard?.accounts
   return (
-    <Panel>
-      <Show when={props.accounts} fallback={<Empty>Loading…</Empty>}>
-        <Show when={props.accounts!.length} fallback={<Empty>Nobody has any yet.</Empty>}>
-          <div>
-            <For each={props.accounts}>
-              {(account, index) => (
-                <div class="row flex items-center gap-3 px-4 py-2.5" classList={{ self: account!.id === props.me.user.id }}>
+    <Panel overflow>
+      <div class="toolbar">
+        <Select
+          class="period-select -ml-2"
+          contentClass="period-menu"
+          options={periods}
+          current={periods.find((item) => item.value === props.period)}
+          value={(item) => item.value}
+          label={(item) => item.label}
+          onSelect={(item) => item && props.setPeriod(item.value)}
+          placement="bottom-start"
+        />
+        <Show when={props.period === "custom"}>
+          <div class="flex items-center gap-1.5 order-last basis-full sm:order-none sm:basis-auto">
+            <TextInput
+              type="date"
+              appearance="small"
+              aria-label="From"
+              class="w-[136px]"
+              value={props.custom.from}
+              max={props.custom.to}
+              onInput={(event) => props.setCustom({ ...props.custom, from: event.currentTarget.value })}
+            />
+            <span class="faint">–</span>
+            <TextInput
+              type="date"
+              appearance="small"
+              aria-label="To"
+              class="w-[136px]"
+              value={props.custom.to}
+              min={props.custom.from}
+              onInput={(event) => props.setCustom({ ...props.custom, to: event.currentTarget.value })}
+            />
+          </div>
+        </Show>
+        <span class="ml-auto faint">{ranked() ? "Received" : "Balance"}</span>
+      </div>
+      <div class="rounded-b-[10px] overflow-hidden" classList={{ stale: props.loading && Boolean(accounts()) }}>
+        <Show when={accounts()} fallback={<Empty>Loading…</Empty>}>
+          <Show
+            when={accounts()!.length}
+            fallback={<Empty>{ranked() ? `Nobody received any ${props.me.config.plural} in this period.` : "Nobody has any yet."}</Empty>}
+          >
+            <For each={accounts()}>
+              {(account: Account, index) => (
+                <div class="row flex items-center gap-3 px-4 py-2.5" classList={{ self: account.id === props.me.user.id }}>
                   <span class="num faint w-6 text-right shrink-0">{index() + 1}</span>
-                  <Avatar src={account!.image ?? undefined} fallback={account!.name} size="large" />
+                  <Avatar src={account.image ?? undefined} fallback={account.name} size="large" />
                   <span class="flex-1 min-w-0 flex items-center gap-2">
-                    <span class="truncate">{account!.name}</span>
-                    <Show when={account!.id === props.me.user.id}>
+                    <span class="truncate">{account.name}</span>
+                    <Show when={account.id === props.me.user.id}>
                       <Badge variant="subtle">You</Badge>
                     </Show>
                   </span>
-                  <span class="faint num hidden sm:inline">{account!.received} received</span>
+                  <span class="faint num hidden sm:inline">
+                    {ranked() ? `${account.given} given` : `${account.received} received`}
+                  </span>
                   <span class="strong min-w-16 flex justify-end">
-                    <Amount me={props.me} value={account!.balance} />
+                    <Amount me={props.me} value={ranked() ? account.received : account.balance} />
                   </span>
                 </div>
               )}
             </For>
-          </div>
+          </Show>
         </Show>
-      </Show>
+      </div>
     </Panel>
   )
 }
@@ -374,7 +502,10 @@ function describe(entry: Entry, history: History, viewer: string | null) {
   switch (entry.kind) {
     case "grant":
       return `${name(entry.to)} got a starting balance`
+    case "allowance":
+      return `${name(entry.to)} got a scheduled grant`
     case "adjust":
+      if (entry.note === "balance reset") return `${name(entry.actor)} reset ${possessive(entry.from ?? entry.to)} balance`
       return entry.to
         ? `${name(entry.actor)} added to ${possessive(entry.to)} balance`
         : `${name(entry.actor)} took from ${possessive(entry.from)} balance`
@@ -409,8 +540,10 @@ function ActivityList(props: { history: History | undefined; me: Me; viewer: str
                     <span class="truncate">{describe(entry, props.history!, props.viewer)}</span>
                     <span class="faint truncate">
                       {ago(entry.at)}
-                      <Show when={entry.note && entry.kind !== "grant"}> · {entry.note}</Show>
-                      <Show when={props.onRedact && entry.note && entry.note !== "redacted" && entry.kind !== "grant"}>
+                      <Show when={entry.note && entry.kind !== "grant" && entry.note !== "balance reset"}> · {entry.note}</Show>
+                      <Show
+                        when={props.onRedact && entry.note && !["redacted", "balance reset"].includes(entry.note) && entry.kind !== "grant"}
+                      >
                         {" · "}
                         <button type="button" class="link bg-transparent border-0 p-0 cursor-pointer" onClick={() => props.onRedact!(entry.id)}>
                           redact
@@ -461,7 +594,7 @@ function people() {
   return directory()
 }
 
-function PersonPicker(props: { value: Person | null; onChange: (person: Person | null) => void; exclude?: string }) {
+function PersonPicker(props: { value: Person | null; onChange: (person: Person | null) => void; exclude?: string[] }) {
   const [query, setQuery] = createSignal("")
   const [open, setOpen] = createSignal(false)
   const [active, setActive] = createSignal(0)
@@ -469,7 +602,7 @@ function PersonPicker(props: { value: Person | null; onChange: (person: Person |
     const text = query().trim().toLowerCase()
     if (!text) return []
     return (people() ?? [])
-      .filter((person) => person.id !== props.exclude && person.name.toLowerCase().includes(text))
+      .filter((person) => !props.exclude?.includes(person.id) && person.name.toLowerCase().includes(text))
       .slice(0, 8)
   })
   const choose = (person: Person) => {
@@ -654,7 +787,7 @@ function GiveView(props: { me: Me; done: () => void }) {
     >
       <form class="px-4 pb-4 flex flex-col gap-4 max-w-[520px]" onSubmit={submit}>
         <Label text="To">
-          <PersonPicker value={person()} onChange={setPerson} exclude={props.me.user.id} />
+          <PersonPicker value={person()} onChange={setPerson} exclude={[props.me.user.id]} />
         </Label>
         <AmountFields
           amount={amount()}
@@ -771,8 +904,10 @@ function AdminView(props: { me: Me; changed: () => void }) {
       <SettingsPanel me={props.me} changed={props.changed} />
       <EmojiPack domain={props.me.team.domain} />
       <AdjustPanel me={props.me} changed={props.changed} />
+      <SchedulesPanel me={props.me} />
       <AdminsPanel me={props.me} />
       <ChannelsPanel />
+      <ResetPanel me={props.me} changed={props.changed} />
       <AllActivityPanel me={props.me} />
     </div>
   )
@@ -1016,6 +1151,276 @@ function AdjustPanel(props: { me: Me; changed: () => void }) {
           </span>
         </div>
       </div>
+    </Panel>
+  )
+}
+
+const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+const weekdayOptions = [1, 2, 3, 4, 5, 6, 0]
+const monthdayOptions = Array.from({ length: 28 }, (_, i) => i + 1)
+const cadences: { value: Cadence; label: string }[] = [
+  { value: "monthly", label: "Monthly" },
+  { value: "weekly", label: "Weekly" },
+]
+
+function ordinal(n: number) {
+  const suffix = n % 10 === 1 && n !== 11 ? "st" : n % 10 === 2 && n !== 12 ? "nd" : n % 10 === 3 && n !== 13 ? "rd" : "th"
+  return `${n}${suffix}`
+}
+
+function dayLabel(cadence: Cadence, day: number) {
+  return cadence === "weekly" ? weekdays[day]! : `the ${ordinal(day)}`
+}
+
+function names(people: { name: string }[]) {
+  if (people.length <= 2) return people.map((person) => person.name).join(" and ")
+  return `${people[0]!.name}, ${people[1]!.name} and ${people.length - 2} more`
+}
+
+function SchedulesPanel(props: { me: Me }) {
+  const [schedules, { refetch, mutate }] = createResource(() => api.schedules())
+  const [amount, setAmount] = createSignal("")
+  const [cadence, setCadence] = createSignal<Cadence>("monthly")
+  const [day, setDay] = createSignal(1)
+  const [who, setWho] = createSignal<"everyone" | "people">("everyone")
+  const [chosen, setChosen] = createSignal<Person[]>([])
+  const [note, setNote] = createSignal("")
+  const [status, setStatus] = createSignal<{ kind: "error" | "ok"; text: string } | null>(null)
+  const [busy, setBusy] = createSignal(false)
+  const ready = () => Number(amount()) > 0 && (who() === "everyone" || chosen().length > 0)
+  const next = (at: number) =>
+    new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(at)
+
+  const add = async () => {
+    setBusy(true)
+    setStatus(null)
+    try {
+      const schedule = await api.addSchedule({
+        amount: Number(amount()),
+        cadence: cadence(),
+        day: day(),
+        people: who() === "everyone" ? null : chosen().map((person) => person.id),
+        note: note().trim() || null,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })
+      setStatus({ kind: "ok", text: `First one goes out ${next(schedule.next)}.` })
+      setAmount("")
+      setNote("")
+      setChosen([])
+      refetch()
+    } catch (error) {
+      setStatus({ kind: "error", text: (error as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async (schedule: Schedule) => {
+    mutate((list) => list?.filter((item) => item.id !== schedule.id))
+    await api.removeSchedule(schedule.id).catch((error: Error) => setStatus({ kind: "error", text: error.message }))
+    refetch()
+  }
+
+  return (
+    <Panel overflow title="Scheduled grants" description={`Add ${props.me.config.plural} to everyone, or to chosen people, every week or month.`}>
+      <div class="px-4 pb-4 flex flex-col gap-4">
+        <Show when={schedules()?.length}>
+          <div class="inset">
+            <For each={schedules()}>
+              {(schedule) => (
+                <div class="row flex items-center gap-3 pl-3 pr-1.5 py-2">
+                  <span class="bank-avatar">
+                    <Coin src={symbolUrl(props.me)} size={20} />
+                  </span>
+                  <div class="flex-1 min-w-0 flex flex-col">
+                    <span class="flex items-center gap-1 min-w-0">
+                      <span class="strong">
+                        <Amount me={props.me} value={schedule.amount} prefix="+" />
+                      </span>
+                      <span class="truncate">to {schedule.people ? names(schedule.people) : "everyone"}</span>
+                    </span>
+                    <span class="faint truncate">
+                      {schedule.cadence === "weekly" ? "Every" : "Monthly on"} {dayLabel(schedule.cadence, schedule.day)} · next {next(schedule.next)}
+                      <Show when={schedule.note}> · {schedule.note}</Show>
+                    </span>
+                  </div>
+                  <IconButton
+                    variant="ghost-muted"
+                    aria-label="Delete schedule"
+                    title="Delete"
+                    icon={<Icon name="outline-trash" size="small" />}
+                    onClick={() => remove(schedule)}
+                  />
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        <div class="flex flex-col gap-4 max-w-[520px]">
+          <div class="grid grid-cols-[96px_1fr_1fr] sm:grid-cols-[112px_1fr_1fr] gap-3">
+            <Label text="Amount">
+              <TextInput
+                class="w-full"
+                numeric
+                inputmode="numeric"
+                placeholder="50"
+                value={amount()}
+                onInput={(event) => setAmount(event.currentTarget.value.replace(/[^0-9]/g, ""))}
+                trailing={
+                  <Show when={symbolUrl(props.me)}>
+                    {(src) => (
+                      <span class="pr-1">
+                        <Coin src={src()} size={16} />
+                      </span>
+                    )}
+                  </Show>
+                }
+              />
+            </Label>
+            <Label text="Repeats">
+              <Select
+                class="field-select"
+                appearance="base"
+                options={cadences}
+                current={cadences.find((item) => item.value === cadence())}
+                value={(item) => item.value}
+                label={(item) => item.label}
+                sameWidth
+                onSelect={(item) => {
+                  if (!item || item.value === cadence()) return
+                  setCadence(item.value)
+                  setDay(1)
+                }}
+              />
+            </Label>
+            <Label text="On">
+              <Select
+                class="field-select"
+                appearance="base"
+                options={cadence() === "weekly" ? weekdayOptions : monthdayOptions}
+                current={day()}
+                value={(item) => String(item)}
+                label={(item) => (cadence() === "weekly" ? weekdays[item]! : ordinal(item))}
+                sameWidth
+                onSelect={(item) => item !== null && setDay(item)}
+              />
+            </Label>
+          </div>
+
+          <Label text="To">
+            <div class="flex flex-col gap-2">
+              <SegmentedControl value={who()} onChange={(value) => value && setWho(value as "everyone" | "people")} class="self-start">
+                <SegmentedControlItem value="everyone">Everyone</SegmentedControlItem>
+                <SegmentedControlItem value="people">Chosen people</SegmentedControlItem>
+              </SegmentedControl>
+              <Show when={who() === "people"}>
+                <PersonPicker
+                  value={null}
+                  onChange={(person) => person && setChosen((list) => [...list, person])}
+                  exclude={chosen().map((person) => person.id)}
+                />
+                <Show when={chosen().length}>
+                  <div class="flex flex-wrap gap-1.5">
+                    <For each={chosen()}>
+                      {(person) => (
+                        <span class="chip">
+                          <Avatar src={person.image ?? undefined} fallback={person.name} size="small" />
+                          <span class="truncate">{person.name}</span>
+                          <button
+                            type="button"
+                            class="chip-remove"
+                            aria-label={`Remove ${person.name}`}
+                            onClick={() => setChosen((list) => list.filter((item) => item.id !== person.id))}
+                          >
+                            <Icon name="close-small" size="small" />
+                          </button>
+                        </span>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </Show>
+            </div>
+          </Label>
+
+          <Label text="Note" hint="optional">
+            <TextInput
+              class="w-full"
+              placeholder={`${cadence()} allowance`}
+              value={note()}
+              onInput={(event) => setNote(event.currentTarget.value)}
+            />
+          </Label>
+
+          <div class="flex items-center gap-3">
+            <Button variant="contrast" disabled={busy() || !ready()} onClick={add}>
+              {busy() ? "Adding…" : "Add schedule"}
+            </Button>
+            <Status value={status()} />
+          </div>
+        </div>
+      </div>
+    </Panel>
+  )
+}
+
+function ResetPanel(props: { me: Me; changed: () => void }) {
+  const [confirming, setConfirming] = createSignal(false)
+  const [busy, setBusy] = createSignal(false)
+  const [status, setStatus] = createSignal<{ kind: "error" | "ok"; text: string } | null>(null)
+  const reset = async () => {
+    setBusy(true)
+    try {
+      const result = await api.reset()
+      setStatus({
+        kind: "ok",
+        text: result.accounts
+          ? `Reset ${result.accounts} ${result.accounts === 1 ? "balance" : "balances"}, ${currency(props.me.config, result.amount)} in all.`
+          : "Every balance was already 0.",
+      })
+      setConfirming(false)
+      props.changed()
+    } catch (error) {
+      setStatus({ kind: "error", text: (error as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Panel
+      title="Reset balances"
+      description="Take everyone's balance to 0. Received and given totals stay, and each reset shows in the activity."
+      action={
+        <Show when={!confirming()}>
+          <Button
+            variant="danger"
+            onClick={() => {
+              setStatus(null)
+              setConfirming(true)
+            }}
+          >
+            Reset balances
+          </Button>
+        </Show>
+      }
+    >
+      <Show when={confirming()}>
+        <div class="footer flex-wrap">
+          <span class="flex-1 min-w-[min(100%,16rem)] strong">Reset every balance to 0? This can't be undone.</span>
+          <Button variant="ghost-muted" disabled={busy()} onClick={() => setConfirming(false)}>
+            Cancel
+          </Button>
+          <Button variant="danger" disabled={busy()} onClick={reset}>
+            {busy() ? "Resetting…" : "Reset all balances"}
+          </Button>
+        </div>
+      </Show>
+      <Show when={status() && !confirming()}>
+        <div class="px-4 pb-4 -mt-1">
+          <Status value={status()} />
+        </div>
+      </Show>
     </Panel>
   )
 }

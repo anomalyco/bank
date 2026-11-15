@@ -24,7 +24,7 @@ export const defaultConfig: Config = {
   notify: true,
 }
 
-export type EntryKind = "grant" | "give" | "reaction" | "refund" | "adjust"
+export type EntryKind = "grant" | "allowance" | "give" | "reaction" | "refund" | "adjust"
 
 export type Entry = {
   id: number
@@ -60,7 +60,28 @@ export type Me = {
 
 export const EMOJI_NAME = /^[a-z0-9_\-+'.]+$/
 
-export type Leaderboard = { accounts: Account[] }
+/** With a period, `received` and `given` count only that period and only people with activity in it are listed. */
+export type Leaderboard = { accounts: Account[]; period: { from: number; to: number } | null }
+
+export type Cadence = "weekly" | "monthly"
+
+export type ScheduleInput = {
+  amount: number
+  cadence: Cadence
+  /** 0 (Sunday) to 6 for weekly, 1 to 28 for monthly. */
+  day: number
+  /** Null for everyone. */
+  people: string[] | null
+  note: string | null
+  timezone: string
+}
+
+export type Schedule = Omit<ScheduleInput, "people"> & {
+  id: number
+  people: { id: string; name: string; image: string | null }[] | null
+  next: number
+  last: number | null
+}
 
 export type History = { entries: Entry[]; people: Record<string, { name: string; image: string | null }> }
 
