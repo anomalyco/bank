@@ -29,9 +29,12 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-button {
-  font: inherit;
-  color: inherit;
+/* Layered, so the UI library's button variants (also layered) can set their own color. */
+@layer base {
+  button {
+    font: inherit;
+    color: inherit;
+  }
 }
 
 .page {
